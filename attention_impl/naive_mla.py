@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 # Transformer Imports
-from transformers.utils import logging
+import logging
 
 # Utils
 from typing import List, Optional, Tuple, Union
@@ -14,7 +14,7 @@ import math
 from .Shared_Args import Args
 from .General_Layers import *
 
-logger = logging.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 gemm_impls = ["bf16", "fp8"] 
 attn_impls = ["naive", "absorb"]
@@ -83,32 +83,15 @@ class MLA(nn.Module):
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
-            
-            # Fix: Cast to float32 for einsum operation in naive implementation
-            q_float = q.float()
-            k_cache_float = self.k_cache[:bsz, :end_pos].float()
-            scores = torch.einsum("bshd,bthd->bsht", q_float, k_cache_float) * self.softmax_scale
-            # Cast back to original dtype
-            scores = scores.to(x.dtype)
-            
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale)
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            
-            # Fix: Cast to float32 for einsum operations
-            q_nope_float = q_nope.float()
-            q_pe_float = q_pe.float()
-            kv_cache_float = self.kv_cache[:bsz, :end_pos].float()
-            pe_cache_float = self.pe_cache[:bsz, :end_pos].float()
-            
-            scores = (torch.einsum("bshc,btc->bsht", q_nope_float, kv_cache_float) +
-                     torch.einsum("bshr,btr->bsht", q_pe_float, pe_cache_float)) * self.softmax_scale
-            
-            # Cast back to original dtype
-            scores = scores.to(x.dtype)
+            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
             
         if mask is not None:
             scores += mask.unsqueeze(1)
