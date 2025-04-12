@@ -58,10 +58,18 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return y.to(dtype)
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    # Ensure x and weight have the same dtype
+    if x.dtype != weight.dtype and weight.element_size() > 1:
+        weight = weight.to(x.dtype)
+        if bias is not None:
+            bias = bias.to(x.dtype)
+    
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
     elif gemm_impl == "bf16":
         weight = weight_dequant(weight, weight.scale)
+        # Ensure the dequantized weight has the same dtype as x
+        weight = weight.to(x.dtype)
         return F.linear(x, weight, bias)
     else:
         x, scale = act_quant(x, block_size)
