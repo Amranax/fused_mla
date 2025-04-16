@@ -13,11 +13,11 @@ import math
 # Local Imports
 from .Shared_Args import Args
 from .General_Layers import *
+from kernels.flash_attention_v2_tri import _flashattention
+
+triton_attention = _flashattention.apply
 
 logger = logging.getLogger(__name__)
-
-gemm_impls = ["bf16", "fp8"] 
-attn_impls = ["naive", "absorb"]
 
 class MLA(nn.Module):
     def __init__(self, args: Args):
@@ -53,7 +53,7 @@ class MLA(nn.Module):
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        if self.attn_impl == "naive":
+        if self.attn_impl == "naive" or self.attn_impl == "naive+flash":
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
         else:
@@ -75,7 +75,7 @@ class MLA(nn.Module):
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         
-        if self.attn_impl == "naive":
+        if self.attn_impl == "naive" or self.attn_impl == "naive+flash":
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -83,7 +83,9 @@ class MLA(nn.Module):
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+
+            if self.attn_impl == "naive":
+                scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
@@ -106,6 +108,19 @@ class MLA(nn.Module):
             
             # Cast back to original dtype
             x = x.to(q.dtype)
+        if self.attn_impl == "naive+flash":
+            # Using flash attention with the cached keys and values
+            cached_k = self.k_cache[:bsz, :end_pos]
+            cached_v = self.v_cache[:bsz, :end_pos]
+            
+            # Apply flash attention
+            x = triton_attention(
+                q,                  # Query [bsz, seqlen, n_heads, head_dim]
+                cached_k,           # Key [bsz, end_pos, n_heads, head_dim]
+                cached_v,           # Value [bsz, end_pos, n_heads, head_dim]
+                mask,               # Attention mask
+                self.softmax_scale  # Scale factor
+            )
         else:
             # Fix: Cast to float32 for einsum operation
             scores_float = scores.float()

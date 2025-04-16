@@ -13,7 +13,7 @@ class Args:
     n_heads: int = 16
 
     # Attention_Impl
-    attn_impl: Literal["naive", "absorb"] = "naive"
+    attn_impl: Literal["naive", "absorb", "naive+flash"] = "naive"
 
     # mla
     q_lora_rank: int = 0
