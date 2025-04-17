@@ -668,13 +668,13 @@ if __name__ == "__main__":
     parser.add_argument("--seq-lengths", type=int, nargs="+", 
                         default=[128, 256, 512, 1024, 2048],
                         help="Sequence lengths to benchmark")
-    parser.add_argument("--heads", type=int, nargs="+", default=[8, 16],
+    parser.add_argument("--heads", type=int, nargs="+", default=[16],
                        help="Number of heads to benchmark")
-    parser.add_argument("--rope-dims", type=int, nargs="+", default=[64],
+    parser.add_argument("--rope-dims", type=int, nargs="+", default=[128],
                        help="RoPE head dimensions to benchmark")
-    parser.add_argument("--nope-dims", type=int, nargs="+", default=[0, 64],
+    parser.add_argument("--nope-dims", type=int, nargs="+", default=[64],
                        help="NoPE head dimensions to benchmark")
-    parser.add_argument("--v-dims", type=int, nargs="+", default=[64, 128],
+    parser.add_argument("--v-dims", type=int, nargs="+", default=[128],
                        help="Value head dimensions to benchmark")
     parser.add_argument("--trials", type=int, default=20,
                        help="Number of trials for each benchmark")
