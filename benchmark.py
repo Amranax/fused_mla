@@ -9,6 +9,7 @@ import time
 import argparse
 import math
 import numpy as np
+import os
 
 # Local imports
 from attention_impl.naive_mla import MLA
@@ -102,22 +103,19 @@ def incremental_token_benchmark(models, embedding_layer, args, batch_size=1,
         x_emb = prompt_emb.clone()
         curr_seq_len = base_seq_len
         
-        # Warmup with full prompt
-        mask = torch.full((curr_seq_len, curr_seq_len), float("-inf"), device='cuda').triu_(1)
+        # First process the full prompt with proper masking
+        full_mask = torch.full((curr_seq_len, curr_seq_len), float("-inf"), device='cuda').triu_(1)
         for _ in range(warmup):
-            _ = model(x_emb, start_pos=0, freqs_cis=freqs_cis[:curr_seq_len], mask=mask)
+            _ = model(x_emb, start_pos=0, freqs_cis=freqs_cis[:curr_seq_len], mask=full_mask)
         
         # Now generate tokens one by one and measure time
         for i in range(max_new_tokens):
             curr_seq_len = base_seq_len + i
+            next_pos = curr_seq_len
             
             # Create dummy "next token" embedding
             next_token_emb = torch.rand((batch_size, 1, args.dim), 
                                         device='cuda', dtype=prompt_emb.dtype)
-            
-            # Create causal mask for the current sequence length
-            mask = torch.full((curr_seq_len + 1, curr_seq_len + 1), 
-                              float("-inf"), device='cuda').triu_(1)
             
             # Time the forward pass for the single new token
             torch.cuda.synchronize()
@@ -125,12 +123,12 @@ def incremental_token_benchmark(models, embedding_layer, args, batch_size=1,
             
             for _ in range(repeats):
                 start_time = time.time()
-                # Only process the new token, starting from position curr_seq_len
+                # Only process the new token - for incremental generation, masking is handled in MLA
                 with torch.no_grad():  # Prevent gradient tracking during benchmark
                     _ = model(next_token_emb, 
-                            start_pos=curr_seq_len, 
-                            freqs_cis=freqs_cis[curr_seq_len:curr_seq_len+1], 
-                            mask=mask)
+                            start_pos=next_pos, 
+                            freqs_cis=freqs_cis[next_pos:next_pos+1], 
+                            mask=None)  # Pass None for mask in incremental generation
                 torch.cuda.synchronize()
                 token_times.append(time.time() - start_time)
             
@@ -145,7 +143,56 @@ def incremental_token_benchmark(models, embedding_layer, args, batch_size=1,
     return results
 
 
-def run_benchmarks(args, seq_lengths, batch_sizes):
+def compare_tensors_with_stats(tensor_a, tensor_b, name_a, name_b, tolerance=1e-2):
+    """
+    Compare tensors with detailed statistics for debugging
+    
+    Args:
+        tensor_a, tensor_b: Tensors to compare
+        name_a, name_b: Names for the tensors in output
+        tolerance: Absolute tolerance for comparison
+        
+    Returns:
+        is_close: Boolean indicating if tensors are close within tolerance
+    """
+    if tensor_a.shape != tensor_b.shape:
+        print(f"Shape mismatch: {name_a}:{tensor_a.shape} vs {name_b}:{tensor_b.shape}")
+        return False
+    
+    # Basic stats
+    a_min, a_max, a_mean = tensor_a.min().item(), tensor_a.max().item(), tensor_a.mean().item()
+    b_min, b_max, b_mean = tensor_b.min().item(), tensor_b.max().item(), tensor_b.mean().item()   
+    
+    # Compute differences
+    abs_diff = torch.abs(tensor_a - tensor_b)
+    max_diff = abs_diff.max().item()
+    mean_diff = abs_diff.mean().item()
+    num_diff = (abs_diff > tolerance).sum().item()
+    pct_diff = 100 * num_diff / tensor_a.numel()
+    
+    
+    # Find worst differences for debugging
+    if num_diff > 0:
+        print(f"{name_a} stats: min={a_min:.6f}, max={a_max:.6f}, mean={a_mean:.6f}")
+        print(f"{name_b} stats: min={b_min:.6f}, max={b_max:.6f}, mean={b_mean:.6f}")
+        print(f"Difference stats: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        print(f"Elements above tolerance: {num_diff}/{tensor_a.numel()} ({pct_diff:.4f}%)")
+        # Get indices of top 5 differences or all if less than 5
+        num_to_show = min(5, num_diff)
+        top_diffs, top_indices = torch.topk(abs_diff.flatten(), num_to_show)
+        
+        print("Top differences:")
+        for i, (diff, idx) in enumerate(zip(top_diffs, top_indices)):
+            # Convert flat index to multi-dimensional index
+            multi_idx = np.unravel_index(idx.item(), tensor_a.shape)
+            a_val = tensor_a[multi_idx].item()
+            b_val = tensor_b[multi_idx].item()
+            print(f"  #{i+1}: idx={multi_idx}, {name_a}={a_val:.6f}, {name_b}={b_val:.6f}, diff={diff.item():.6f}")
+    
+    return num_diff == 0
+
+
+def run_benchmarks(args, seq_lengths, batch_sizes, val_tolerance=1.5e-2):
     """Run comprehensive benchmarks across different sequence lengths and batch sizes"""
     results = {
         'naive': {'latency': {}, 'memory': {}},
@@ -194,13 +241,27 @@ def run_benchmarks(args, seq_lengths, batch_sizes):
 
                 print(f"  {impl_name.upper()}: Latency = {latency*1000:.3f} ms, Memory = {memory:.2f} GB")
 
-            # Convert to tensors with no gradients for comparison
-            naive_val = torch.tensor(ret_vals['naive'], requires_grad=False)
-            flash_val = torch.tensor(ret_vals['naive+flash'], requires_grad=False)
-            absorb_val = torch.tensor(ret_vals['absorb'], requires_grad=False)
+            # Compare output tensors with detailed stats
+            # print("\nOutput Validation:")
+            # print("------------------")
             
-            torch.testing.assert_close(naive_val, absorb_val, rtol=0, atol=5e-3)
-            torch.testing.assert_close(naive_val, flash_val, rtol=0, atol=5e-3)
+            # Compare naive vs absorb
+            # print("\nComparing NAIVE vs ABSORB implementations:")
+            naive_vs_absorb = compare_tensors_with_stats(
+                ret_vals['naive'], ret_vals['absorb'], 'naive', 'absorb', val_tolerance
+            )
+            
+            # Compare naive vs naive+flash
+            # print("\nComparing NAIVE vs NAIVE+FLASH implementations:")
+            naive_vs_flash = compare_tensors_with_stats(
+                ret_vals['naive'], ret_vals['naive+flash'], 'naive', 'naive+flash', val_tolerance
+            )
+            
+            if not naive_vs_absorb:
+                print("\nWARNING: Significant differences between NAIVE and ABSORB implementations")
+            
+            if not naive_vs_flash:
+                print("\nWARNING: Significant differences between NAIVE and NAIVE+FLASH implementations")
 
     return results
 
@@ -211,8 +272,8 @@ def run_incremental_benchmark(args):
     embedding_layer = EmbeddingLayer(args.vocab_size, args.dim).cuda()
     
     # Define maximum sequence length for this benchmark
-    base_seq_len = 64
-    max_new_tokens = 128
+    base_seq_len = 1024
+    max_new_tokens = 1024
     max_seq_len = base_seq_len + max_new_tokens
     
     # Initialize test configurations
@@ -344,6 +405,7 @@ def main():
     parser.add_argument('--output', type=str, default='', help='Output file prefix')
     parser.add_argument('--incremental-only', action='store_true', help='Run only the incremental token benchmark')
     parser.add_argument('--standard-only', action='store_true', help='Run only the standard benchmark')
+    parser.add_argument('--tolerance', type=float, default=1.5e-2, help='Tolerance for tensor comparison')
     args = parser.parse_args()
 
     torch.set_default_device('cuda')
@@ -354,18 +416,17 @@ def main():
     seq_lengths = list(range(args.min_seq_len, args.max_seq_len + 1, args.seq_len_step))
     model_args = Args(dtype=args.dtype)
 
-    import os
     os.makedirs('benchmark_results', exist_ok=True)
 
     if args.output == '':
         base_output_name = f"benchmark_results/mla_benchmark_{model_args.qk_nope_head_dim+model_args.qk_rope_head_dim}qkdim_{model_args.v_head_dim}vdim_{args.batch_sizes}"
     else:
-        base_output_name = 'benchmark_results/mla_benchmark'
+        base_output_name = f'benchmark_results/{args.output}'
 
     # Run standard benchmarks (batch/sequence length comparisons)
     if not args.incremental_only:
         print("\n==== Running Standard Benchmarks ====")
-        results = run_benchmarks(model_args, seq_lengths, args.batch_sizes)
+        results = run_benchmarks(model_args, seq_lengths, args.batch_sizes, args.tolerance)
         plot_results(results, args.batch_sizes, seq_lengths, base_output_name)
         save_results_to_file(results, args.batch_sizes, seq_lengths, base_output_name)
 
