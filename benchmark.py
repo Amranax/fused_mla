@@ -155,7 +155,7 @@ def main():
     parser = argparse.ArgumentParser(description='Benchmark MLA implementations')
     parser.add_argument('--dtype', type=str, default='bf16', choices=['bf16', 'fp8'], help='Data type for benchmark')
     parser.add_argument('--min-seq-len', type=int, default=128, help='Minimum sequence length to benchmark')
-    parser.add_argument('--max-seq-len', type=int, default=2048, help='Maximum sequence length to benchmark')
+    parser.add_argument('--max-seq-len', type=int, default=4096, help='Maximum sequence length to benchmark')
     parser.add_argument('--seq-len-step', type=int, default=256, help='Step size for sequence length')
     parser.add_argument('--batch-sizes', type=int, nargs='+', default=[1, 4], help='Batch sizes to benchmark')
     parser.add_argument('--output', type=str, default='mla_benchmark', help='Output file prefix')

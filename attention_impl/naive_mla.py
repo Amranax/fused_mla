@@ -14,7 +14,6 @@ import math
 from .Shared_Args import Args
 from .General_Layers import *
 
-# from kernels.flash_attention_v2_tri import _flashattention
 from kernels.flash_attention_v2_tri_ref import _attention as _flashattention
 
 
