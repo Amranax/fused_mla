@@ -170,11 +170,11 @@ def main():
 
     import os
     os.makedirs('benchmark_results', exist_ok=True)
-    
+
     if args.output == '':
-        output_name = f"mla_benchmark_{model_args.qk_nope_head_dim+model_args.qk_rope_head_dim}qkdim_{model_args.v_head_dim}vdim_{args.batch_sizes}"
+        output_name = f"benchmark_results/mla_benchmark_{model_args.qk_nope_head_dim+model_args.qk_rope_head_dim}qkdim_{model_args.v_head_dim}vdim_{args.batch_sizes}"
     else:
-        output_name = 'mla_benchmark'
+        output_name = 'benchmark_results/mla_benchmark'
 
     results = run_benchmarks(model_args, seq_lengths, args.batch_sizes)
 
