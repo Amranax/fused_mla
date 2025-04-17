@@ -1,5 +1,5 @@
 """
-Fused Attention
+Flash Attention
 ===============
 
 This is a Triton implementation of the Flash Attention v2 algorithm from Tri Dao (https://tridao.me/publications/flash2/flash2.pdf)
@@ -18,9 +18,12 @@ https://github.com/triton-lang/triton
 
 """
 import torch
+import torch.nn.functional as F
 
 import triton
 import triton.language as tl
+
+import math
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
@@ -33,7 +36,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX: tl.constexpr, fp8_v: tl.constexpr):
+                    N_CTX: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -73,10 +76,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 
         # update acc
         v = tl.load(V_block_ptr)
-        if fp8_v:
-            p = p.to(tl.float8e5)
-        else:
-            p = p.to(v.dtype)
+        p = p.to(v.dtype)
         acc = tl.dot(p, v, acc)
         
         # update m_i and l_i
@@ -89,16 +89,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
 # the code below and commenting out the equivalent parameters is convenient for
 # re-tuning.
-# configs = [
-#     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-#     for BM in [64, 128]\
-#     for BN in [32, 64]\
-#     for s in [3, 4, 7]\
-#     for w in [4, 8]\
-# ]
 configs = [
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    for BM in [64, 128]\
+    for BN in [32, 64]\
+    for s in [3, 4, 7]\
+    for w in [4, 8]\
 ]
+# configs = [
+#     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+# ]
 
 
 def keep(conf):
@@ -116,7 +116,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
               stride_kz, stride_kh, stride_kn, stride_kk,  #
               stride_vz, stride_vh, stride_vk, stride_vn,  #
               stride_oz, stride_oh, stride_om, stride_on,  #
-              Z, H, N_CTX,  #
+              B, H, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -182,7 +182,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                        4 - STAGE, offs_m, offs_n, N_CTX  #
                                         )
     # stage 2: on-band
     if STAGE & 2:
@@ -191,7 +191,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                        2, offs_m, offs_n, N_CTX  #
                                         )
     # epilogue
     m_i += tl.math.log2(l_i)
@@ -201,6 +201,15 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
+def pad_to_pow2(x):
+    head_dim = x.shape[-1]
+    if head_dim not in {16, 32, 64, 128, 256}:
+        next_pow2 = 2 ** math.ceil(math.log2(head_dim))
+        pad_len = next_pow2 - head_dim
+        padding = (0, pad_len)  # Only pad the last dimension
+        x = F.pad(x, padding, value=0)
+    return x
+    
 class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
@@ -208,64 +217,52 @@ class _attention(torch.autograd.Function):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1] # when v is in float8_e5m2 it is transposed.
-        assert HEAD_DIM_Q == HEAD_DIM_K == HEAD_DIM_V
+        assert HEAD_DIM_Q == HEAD_DIM_K
+
+        # Pad
+        if HEAD_DIM_K not in {16, 32, 64, 128, 256}:
+            k = pad_to_pow2(k)
+            q = pad_to_pow2(q)
+
+        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
         stage = 3 if causal else 1
-        extra_kern_args = {}
 
-        # --- FIX STARTS HERE ---
-
-        # Input shape is (Z, N_CTX, H, HEAD_DIM) based on your prints
-        # e.g., (4, 640, 16, 128)
-        Z = q.shape[0]
+        # Input shape (B, N_CTX, H, HEAD_DIM)
+        B = q.shape[0]
         N_CTX = q.shape[1] # Actual sequence length
         H = q.shape[2]     # Actual number of heads
-        # HEAD_DIM_K is already correctly calculated from q.shape[-1]
 
         o = torch.empty_like(q)
-        # M shape should be (Z, H, N_CTX) matching kernel's internal logic for M ptrs
-        M = torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32) # Adjusted shape for M
+        M = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
 
-        # Grid calculation using CORRECT N_CTX and H
         # Grid dim 0 depends on N_CTX (sequence length along M dim)
-        # Grid dim 1 depends on Z * H (batch * heads)
-        grid = lambda args: (triton.cdiv(N_CTX, args["BLOCK_M"]), Z * H, 1)
+        # Grid dim 1 depends on B * H (batch * heads)
+        grid = lambda args: (triton.cdiv(N_CTX, args["BLOCK_M"]), B * H, 1)
 
-        # ----- DEBUG PRINTS START (Optional: keep or remove) -----
-        # print(f"--- Corrected Interpretation ---")
         # print(f"[DEBUG] q.shape: {q.shape}, q.stride(): {q.stride()}, q.is_contiguous(): {q.is_contiguous()}")
         # print(f"[DEBUG] k.shape: {k.shape}, k.stride(): {k.stride()}, k.is_contiguous(): {k.is_contiguous()}")
         # print(f"[DEBUG] v.shape: {v.shape}, v.stride(): {v.stride()}, v.is_contiguous(): {v.is_contiguous()}")
         # print(f"[DEBUG] o.shape: {o.shape}, o.stride(): {o.stride()}, o.is_contiguous(): {o.is_contiguous()}")
         # print(f"[DEBUG] Correct N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM_K}, Z: {Z}, Correct H: {H}")
         # print(f"[DEBUG] causal: {causal}, sm_scale: {sm_scale}, stage: {stage}")
-        # ----- DEBUG PRINTS END -----
 
         _attn_fwd[grid](
-            q, k, v, sm_scale, M, o,  # Tensor arguments
-            # Stride arguments - REORDERED to match kernel expectations (Z, H, M/N, K/V)
-            # Kernel expects: stride_qz, stride_qh, stride_qm, stride_qk
-            # Actual layout:   (Z=0,    N_CTX=1,  H=2,      HDIM=3)
-            # So we pass:      stride(0), stride(2), stride(1), stride(3)
+            q, k, v, sm_scale, M, o, 
+          # Stride arguments - REORDERED to match kernel expectations (Z, H, M/N, K/V)
+          #        (Z=0,     N_CTX=1,         H=2,      HDIM=3)
+          #   stride_qz,   stride_qh,   stride_qm,   stride_qk,
             q.stride(0), q.stride(2), q.stride(1), q.stride(3),  # Strides for Q
             k.stride(0), k.stride(2), k.stride(1), k.stride(3),  # Strides for K
             v.stride(0), v.stride(2), v.stride(1), v.stride(3),  # Strides for V
             o.stride(0), o.stride(2), o.stride(1), o.stride(3),  # Strides for O
-            # Dimension arguments - Pass CORRECT values
-            Z, H,
+            B, H,
             N_CTX=N_CTX,
             HEAD_DIM=HEAD_DIM_K,
             STAGE=stage,
-            **extra_kern_args
         )
 
-        # --- FIX ENDS HERE ---
-
-        # ctx.save_for_backward(q, k, v, o, M) # Keep commented if backward not needed
-        # ctx.sm_scale = sm_scale
-        # ctx.HEAD_DIM = HEAD_DIM_K
-        # ctx.causal = causal
         return o
 
     @staticmethod
