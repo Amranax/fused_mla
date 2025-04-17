@@ -475,7 +475,10 @@ def generate_summary_report(df, output_file):
         f.write("- Peak memory usage (MB)\n\n")
         
         # Filter out rows with errors
-        clean_df = df[~df.get('error', pd.Series([False] * len(df))).fillna(False)]
+        if 'error' in df.columns:
+            clean_df = df[df['error'].isna()]
+        else:
+            clean_df = df
         
         # Fastest implementation by sequence length
         f.write("## Fastest Implementation by Sequence Length\n\n")
@@ -663,7 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("--implementations", type=str, nargs="+", 
                         default=["naive", "absorb", "naive+flash"],
                         help="MLA implementations to benchmark")
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 8],
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4],
                        help="Batch sizes to benchmark")
     parser.add_argument("--seq-lengths", type=int, nargs="+", 
                         default=[128, 256, 512, 1024, 2048],
