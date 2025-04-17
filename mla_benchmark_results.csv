@@ -1,5 +1,0 @@
-implementation,batch_size,seq_length,latency_ms,memory_gb
-naive,1,1024,11.433,1.521
-naive,4,1024,29.101,2.401
-absorb,1,1024,12.830,1.763
-absorb,4,1024,87.597,3.219

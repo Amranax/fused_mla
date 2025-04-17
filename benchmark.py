@@ -153,11 +153,12 @@ def main():
     parser = argparse.ArgumentParser(description='Benchmark MLA implementations')
     parser.add_argument('--dtype', type=str, default='bf16', choices=['bf16', 'fp8'], help='Data type for benchmark')
     parser.add_argument('--min-seq-len', type=int, default=128, help='Minimum sequence length to benchmark')
-    parser.add_argument('--max-seq-len', type=int, default=2048, help='Maximum sequence length to benchmark')
+    parser.add_argument('--max-seq-len', type=int, default=1024, help='Maximum sequence length to benchmark')
     parser.add_argument('--seq-len-step', type=int, default=256, help='Step size for sequence length')
     parser.add_argument('--batch-sizes', type=int, nargs='+', default=[1, 4], help='Batch sizes to benchmark')
-    parser.add_argument('--output', type=str, default='mla_benchmark', help='Output file prefix')
+    parser.add_argument('--output', type=str, default='', help='Output file prefix')
     args = parser.parse_args()
+
 
     torch.set_default_device('cuda')
     if args.dtype == 'bf16':
@@ -167,10 +168,18 @@ def main():
     seq_lengths = list(range(args.min_seq_len, args.max_seq_len + 1, args.seq_len_step))
     model_args = Args(dtype=args.dtype)
 
+    import os
+    os.makedirs('benchmark_results', exist_ok=True)
+    
+    if args.output == '':
+        output_name = f"mla_benchmark_{model_args.qk_nope_head_dim+model_args.qk_rope_head_dim}qkdim_{model_args.v_head_dim}vdim_{args.batch_sizes}"
+    else:
+        output_name = 'mla_benchmark'
+
     results = run_benchmarks(model_args, seq_lengths, args.batch_sizes)
 
-    plot_results(results, args.batch_sizes, seq_lengths, args.output)
-    save_results_to_file(results, args.batch_sizes, seq_lengths, args.output)
+    plot_results(results, args.batch_sizes, seq_lengths, output_name)
+    save_results_to_file(results, args.batch_sizes, seq_lengths, output_name)
 
 
 if __name__ == "__main__":

@@ -89,16 +89,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
 # the code below and commenting out the equivalent parameters is convenient for
 # re-tuning.
-configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-    for BM in [64, 128]\
-    for BN in [32, 64]\
-    for s in [3, 4, 7]\
-    for w in [4, 8]\
-]
 # configs = [
-#     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+#     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+#     for BM in [64, 128]\
+#     for BN in [32, 64]\
+#     for s in [3, 4, 7]\
+#     for w in [4, 8]\
 # ]
+configs = [
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=1, num_warps=4),
+]
 
 
 def keep(conf):
@@ -252,6 +252,7 @@ class _attention(torch.autograd.Function):
             q, k, v, sm_scale, M, o, 
           # Stride arguments - REORDERED to match kernel expectations (Z, H, M/N, K/V)
           #        (Z=0,     N_CTX=1,         H=2,      HDIM=3)
+
           #   stride_qz,   stride_qh,   stride_qm,   stride_qk,
             q.stride(0), q.stride(2), q.stride(1), q.stride(3),  # Strides for Q
             k.stride(0), k.stride(2), k.stride(1), k.stride(3),  # Strides for K
@@ -262,6 +263,12 @@ class _attention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM_K,
             STAGE=stage,
         )
+
+        if HEAD_DIM_V != HEAD_DIM_K:
+            # print(f"Truncating o from {HEAD_DIM_K} to {HEAD_DIM_V}")
+            # print(f"o shape before: {o.shape}")
+            o = o[:, :, :, :HEAD_DIM_V]
+            # print(f"o shape after: {o.shape}")
 
         return o
 
