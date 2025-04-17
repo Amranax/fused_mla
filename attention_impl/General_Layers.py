@@ -86,14 +86,17 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+        nn.init.xavier_uniform_(self.weight)
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+            nn.init.xavier_uniform_(self.weight.scale)
         else:
             self.register_parameter("scale", None)
         if bias:
             self.bias = nn.Parameter(torch.empty(self.part_out_features))
+            nn.init.xavier_uniform_(self.bias)
         else:
             self.register_parameter("bias", None)
 
@@ -147,6 +150,7 @@ class EmbeddingLayer(nn.Module):
         self.vocab_start_idx = 0
         self.vocab_end_idx = vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, device='cuda'))
+        nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.embedding(x, self.weight)

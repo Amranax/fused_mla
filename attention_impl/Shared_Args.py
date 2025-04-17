@@ -18,9 +18,10 @@ class Args:
     # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
-    qk_nope_head_dim: int = 128
+    qk_nope_head_dim: int = 64
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
+    
     # yarn
     original_seq_len: int = 4096
     rope_theta: float = 10000.0

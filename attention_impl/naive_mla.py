@@ -13,7 +13,10 @@ import math
 # Local Imports
 from .Shared_Args import Args
 from .General_Layers import *
-from kernels.flash_attention_v2_tri import _flashattention
+
+# from kernels.flash_attention_v2_tri import _flashattention
+from kernels.flash_attention_v2_tri_ref import _attention as _flashattention
+
 
 triton_attention = _flashattention.apply
 
@@ -83,6 +86,7 @@ class MLA(nn.Module):
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
+            # print(f"K Shape {k.shape} V Shape {v.shape}")
 
             if self.attn_impl == "naive":
                 scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
@@ -94,21 +98,23 @@ class MLA(nn.Module):
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
-            
-        if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        
+        if self.attn_impl != "naive+flash": 
+            if mask is not None:
+                scores += mask.unsqueeze(1)
+            scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
         
         if self.attn_impl == "naive":
             # Fix: Cast to float32 for einsum operation
             scores_float = scores.float()
             v_cache_float = self.v_cache[:bsz, :end_pos].float()
+            # print(f"Scores Shape {k.shape} V Cache Shape {v_cache_float.shape}")
             
             x = torch.einsum("bsht,bthd->bshd", scores_float, v_cache_float)
             
             # Cast back to original dtype
             x = x.to(q.dtype)
-        if self.attn_impl == "naive+flash":
+        elif self.attn_impl == "naive+flash":
             # Using flash attention with the cached keys and values
             cached_k = self.k_cache[:bsz, :end_pos]
             cached_v = self.v_cache[:bsz, :end_pos]
@@ -118,7 +124,7 @@ class MLA(nn.Module):
                 q,                  # Query [bsz, seqlen, n_heads, head_dim]
                 cached_k,           # Key [bsz, end_pos, n_heads, head_dim]
                 cached_v,           # Value [bsz, end_pos, n_heads, head_dim]
-                mask,               # Attention mask
+                False,
                 self.softmax_scale  # Scale factor
             )
         else:
