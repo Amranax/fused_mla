@@ -112,10 +112,9 @@ def plot_results(results, batch_sizes, seq_lengths, output_prefix="benchmark"):
 
     for i, batch_size in enumerate(batch_sizes):
         plt.subplot(2, len(batch_sizes), i + 1)
-        naive_latency = [results['naive']['latency'][batch_size][seq_len] * 1000 for seq_len in seq_lengths]
-        absorb_latency = [results['absorb']['latency'][batch_size][seq_len] * 1000 for seq_len in seq_lengths]
-        plt.plot(seq_lengths, naive_latency, 'o-', label='Naive')
-        plt.plot(seq_lengths, absorb_latency, 'o-', label='Absorb')
+        for name,val in results.items():
+            latency = [results[name]['latency'][batch_size][seq_len] * 1000 for seq_len in seq_lengths]
+            plt.plot(seq_lengths, latency, 'o-', label=name)
         plt.title(f'Latency (Batch Size = {batch_size})')
         plt.xlabel('Sequence Length')
         plt.ylabel('Time (ms)')
@@ -124,10 +123,9 @@ def plot_results(results, batch_sizes, seq_lengths, output_prefix="benchmark"):
 
     for i, batch_size in enumerate(batch_sizes):
         plt.subplot(2, len(batch_sizes), len(batch_sizes) + i + 1)
-        naive_memory = [results['naive']['memory'][batch_size][seq_len] for seq_len in seq_lengths]
-        absorb_memory = [results['absorb']['memory'][batch_size][seq_len] for seq_len in seq_lengths]
-        plt.plot(seq_lengths, naive_memory, 'o-', label='Naive')
-        plt.plot(seq_lengths, absorb_memory, 'o-', label='Absorb')
+        for name,val in results.items():
+            memory = [results[name]['memory'][batch_size][seq_len] for seq_len in seq_lengths]
+            plt.plot(seq_lengths, memory, 'o-', label=name)
         plt.title(f'Memory Usage (Batch Size = {batch_size})')
         plt.xlabel('Sequence Length')
         plt.ylabel('Memory (GB)')
@@ -142,7 +140,7 @@ def plot_results(results, batch_sizes, seq_lengths, output_prefix="benchmark"):
 def save_results_to_file(results, batch_sizes, seq_lengths, output_prefix="benchmark"):
     with open(f'{output_prefix}_results.csv', 'w') as f:
         f.write('implementation,batch_size,seq_length,latency_ms,memory_gb\n')
-        for impl in ['naive', 'absorb']:
+        for impl in ['naive', 'absorb', 'naive+flash']:
             for batch_size in batch_sizes:
                 for seq_len in seq_lengths:
                     latency = results[impl]['latency'][batch_size][seq_len] * 1000
@@ -155,7 +153,7 @@ def main():
     parser = argparse.ArgumentParser(description='Benchmark MLA implementations')
     parser.add_argument('--dtype', type=str, default='bf16', choices=['bf16', 'fp8'], help='Data type for benchmark')
     parser.add_argument('--min-seq-len', type=int, default=128, help='Minimum sequence length to benchmark')
-    parser.add_argument('--max-seq-len', type=int, default=4096, help='Maximum sequence length to benchmark')
+    parser.add_argument('--max-seq-len', type=int, default=2048, help='Maximum sequence length to benchmark')
     parser.add_argument('--seq-len-step', type=int, default=256, help='Step size for sequence length')
     parser.add_argument('--batch-sizes', type=int, nargs='+', default=[1, 4], help='Batch sizes to benchmark')
     parser.add_argument('--output', type=str, default='mla_benchmark', help='Output file prefix')
