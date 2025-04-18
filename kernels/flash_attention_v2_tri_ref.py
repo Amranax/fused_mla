@@ -251,7 +251,7 @@ class _attention(torch.autograd.Function):
         N_CTX = q.shape[1] # Actual sequence length
         H = q.shape[2]     # Actual number of heads
 
-        o = torch.empty_like(q)
+        o = torch.empty_like(v)
         M = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
 
         # Grid dim 0 depends on N_CTX (sequence length along M dim)
@@ -282,11 +282,11 @@ class _attention(torch.autograd.Function):
             STAGE=stage,
         )
 
-        if HEAD_DIM_V != HEAD_DIM_K:
-            # print(f"Truncating o from {HEAD_DIM_K} to {HEAD_DIM_V}")
-            # print(f"o shape before: {o.shape}")
-            o = o[:, :, :, :HEAD_DIM_V]
-            # print(f"o shape after: {o.shape}")
+        # if HEAD_DIM_V != HEAD_DIM_K:
+        #     # print(f"Truncating o from {HEAD_DIM_K} to {HEAD_DIM_V}")
+        #     # print(f"o shape before: {o.shape}")
+        #     o = o[:, :, :, :HEAD_DIM_V]
+        #     # print(f"o shape after: {o.shape}")
 
         return o
 
