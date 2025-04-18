@@ -27,23 +27,21 @@ import math
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
-
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     K_block_ptr, V_block_ptr,  #
                     start_m, qk_scale,  #
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    BLOCK_M: tl.constexpr, HEAD_DIM_QK: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr):
-    # range of values handled by this stage
+    # Causal = True (1st Stage)
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
+    # Causal = True (1st Stage)
     elif STAGE == 2:
         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)
-    # causal = False
+    # Causal = False
     else:
         lo, hi = 0, N_CTX
         
@@ -58,34 +56,40 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         k = tl.load(K_block_ptr)
         qk = tl.dot(q, k)
 
+        qk = qk * qk_scale # Scale
+
         if STAGE == 2:
+            # Apply masking for diagonal part
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
-        else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
-            
+            qk += tl.where(mask, 0, -1.0e6)
+
+        # Remove local max to prevent overflow
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+
+        # Numerator    
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
         
-        # -- update m_i and l_i
+        # Scaling factor based on old and new max
         alpha = tl.math.exp2(m_i - m_ij)
+        
+        # Update running denominator sum
         l_i = l_i * alpha + l_ij
         
-        # -- update output accumulator --
+        # Scale previous acc
         acc = acc * alpha[:, None]
 
-        # update acc
+        # Multiply with V
         v = tl.load(V_block_ptr)
         p = p.to(v.dtype)
         acc = tl.dot(p, v, acc)
         
-        # update m_i and l_i
+        # Update
         m_i = m_ij
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+
     return acc, l_i, m_i
 
 
@@ -147,7 +151,6 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
         block_shape=(BLOCK_M, HEAD_DIM_QK),
         order=(1, 0),
     )
-
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
