@@ -251,6 +251,11 @@ class _attention(torch.autograd.Function):
         N_CTX = q.shape[1] # Actual sequence length
         H = q.shape[2]     # Actual number of heads
 
+        # Reshape q,k,v to supported (B, N_CTX, H, HDIM) -> (B, H, N_CTX, HDIM)
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
         o = torch.empty_like(v)
         M = torch.empty((B, H, N_CTX), device=q.device, dtype=torch.float32)
 
@@ -271,10 +276,10 @@ class _attention(torch.autograd.Function):
           #        (B=0,     N_CTX=1,         H=2,      HDIM=3)
 
           #   stride_qz,   stride_qh,   stride_qm,   stride_qk,
-            q.stride(0), q.stride(2), q.stride(1), q.stride(3),  # Strides for Q
-            k.stride(0), k.stride(2), k.stride(1), k.stride(3),  # Strides for K
-            v.stride(0), v.stride(2), v.stride(1), v.stride(3),  # Strides for V
-            o.stride(0), o.stride(2), o.stride(1), o.stride(3),  # Strides for O
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  # Strides for Q
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  # Strides for K
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  # Strides for V
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  # Strides for O
             B, H,
             N_CTX=N_CTX,
             HEAD_DIM_QK=HEAD_DIM_K,
