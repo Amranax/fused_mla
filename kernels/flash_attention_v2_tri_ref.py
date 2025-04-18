@@ -110,7 +110,7 @@ def keep(conf):
     return True
 
 
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
+@triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM_QK", "HEAD_DIM_V"])
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
               stride_qb, stride_qh, stride_qm, stride_qk,  #
@@ -192,7 +192,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                        BLOCK_M, HEAD_DIM_QK, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX  #
                                         )
     # stage 2: on-band
@@ -201,7 +201,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
         # two loops independently
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
                                         start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                        BLOCK_M, HEAD_DIM_QK, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX  #
                                         )
     # epilogue
