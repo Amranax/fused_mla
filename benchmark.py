@@ -215,9 +215,9 @@ def run_benchmarks(args, seq_lengths, batch_sizes, val_tolerance=1.5e-2):
 
             # Initialize test configurations
             test_configs = {
-                'naive': Args(attn_impl="naive", dtype=args.dtype, max_seq_len=seq_len * 4),
-                'absorb': Args(attn_impl="absorb", dtype=args.dtype, max_seq_len=seq_len * 4),
-                'naive+flash': Args(attn_impl="naive+flash", dtype=args.dtype, max_seq_len=seq_len * 4),
+                'naive': Args(attn_impl="naive", dtype=args.dtype, max_seq_len=seq_len + 128),
+                'absorb': Args(attn_impl="absorb", dtype=args.dtype, max_seq_len=seq_len + 128),
+                'naive+flash': Args(attn_impl="naive+flash", dtype=args.dtype, max_seq_len=seq_len + 128),
             }
 
             # Initialize all models with the same weights
