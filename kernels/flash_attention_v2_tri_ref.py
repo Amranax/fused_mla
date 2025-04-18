@@ -5,7 +5,7 @@ Flash Attention
 This is a Triton implementation of the Flash Attention v2 algorithm from Tri Dao (https://tridao.me/publications/flash2/flash2.pdf)
 This original implementation was taken from the Triton-Lange Repo
 
-The code was changed to suite my projects needs
+The code was changed to suit my projects needs
 - Removed TMA support (Limited to H100 GPUs anyway)
 - Removed AMD GPU support
 - Removed Backward pass (To keep its memory constraints usage fair)
@@ -57,6 +57,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # -- compute qk ----
         k = tl.load(K_block_ptr)
         qk = tl.dot(q, k)
+
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -65,6 +66,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         else:
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             qk = qk * qk_scale - m_ij[:, None]
+            
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
         
@@ -145,6 +147,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
         block_shape=(BLOCK_M, HEAD_DIM_QK),
         order=(1, 0),
     )
+
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
@@ -160,7 +163,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
         block_shape=(HEAD_DIM_QK, BLOCK_N),
-        order=(0, 1),
+        order=(1, 0),
     )
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
@@ -218,7 +221,7 @@ def pad_to_pow2(x):
         next_pow2 = 2 ** math.ceil(math.log2(head_dim))
         pad_len = next_pow2 - head_dim
         padding = (0, pad_len)  # Only pad the last dimension
-        x = F.pad(x, padding, value=0)
+        x = F.pad(x, padding, value=0).contiguous()
     return x
     
 class _attention(torch.autograd.Function):
@@ -234,8 +237,8 @@ class _attention(torch.autograd.Function):
         if HEAD_DIM_K not in {16, 32, 64, 128, 256}:
             k = pad_to_pow2(k)
             q = pad_to_pow2(q)
-
-        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+            HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+            
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
         stage = 3 if causal else 1
