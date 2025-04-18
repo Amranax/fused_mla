@@ -226,19 +226,20 @@ def run_benchmarks(args, seq_lengths, batch_sizes, val_tolerance=1.5e-2):
                 # Initialize model with fresh random seed
                 set_seed(42)
                 
-                # Create just this model
+                # Create model for memory test
                 model = MLA(test_configs[impl]).cuda().eval()
-                
-                # If this is the first model, save its state dict for others
-                if impl == 'naive':
-                    base_state_dict = model.state_dict()
-                else:
-                    # Otherwise, load the state from the base model
-                    model.load_state_dict(base_state_dict)
-                
-                # Run both benchmarks
                 memory, val = memory_benchmark(model, x_emb, start_pos, freqs_cis, mask)
+                
+                # Reset
+                del model
+                torch.cuda.empty_cache()
+
+                # Create model for latency test
+                model = MLA(test_configs[impl]).cuda().eval()
                 latency = latency_benchmark(model, x_emb, start_pos, freqs_cis, mask)
+                # Reset
+                del model
+                torch.cuda.empty_cache()
                 
                 # Store results
                 ret_vals[impl] = val
@@ -247,9 +248,6 @@ def run_benchmarks(args, seq_lengths, batch_sizes, val_tolerance=1.5e-2):
                 
                 print(f"  {impl.upper()}: Latency = {latency*1000:.3f} ms, Memory = {memory:.2f} GB")
                 
-                # Explicitly delete the model and clear cache
-                del model
-                torch.cuda.empty_cache()
 
             # Compare naive vs absorb
             naive_vs_absorb = compare_tensors_with_stats(
