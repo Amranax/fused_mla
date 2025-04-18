@@ -221,38 +221,42 @@ def run_benchmarks(args, seq_lengths, batch_sizes, val_tolerance=1.5e-2):
             }
 
             # Initialize all models with the same weights
-            models = {}
-            set_seed(42)
-            base_model = MLA(test_configs['naive']).cuda().eval()
-            for impl in test_configs:
-                model = MLA(test_configs[impl]).cuda().eval()
-                model.load_state_dict(base_model.state_dict())
-                models[impl] = model
-
             ret_vals = {}
-            for impl_name, model in models.items():
+            for impl in test_configs:
+                # Initialize model with fresh random seed
+                set_seed(42)
+                
+                # Create just this model
+                model = MLA(test_configs[impl]).cuda().eval()
+                
+                # If this is the first model, save its state dict for others
+                if impl == 'naive':
+                    base_state_dict = model.state_dict()
+                else:
+                    # Otherwise, load the state from the base model
+                    model.load_state_dict(base_state_dict)
+                
+                # Run both benchmarks
                 memory, val = memory_benchmark(model, x_emb, start_pos, freqs_cis, mask)
-                ret_vals[impl_name] = val
-
                 latency = latency_benchmark(model, x_emb, start_pos, freqs_cis, mask)
+                
+                # Store results
+                ret_vals[impl] = val
+                results[impl]['latency'].setdefault(batch_size, {})[seq_len] = latency
+                results[impl]['memory'].setdefault(batch_size, {})[seq_len] = memory
+                
+                print(f"  {impl.upper()}: Latency = {latency*1000:.3f} ms, Memory = {memory:.2f} GB")
+                
+                # Explicitly delete the model and clear cache
+                del model
+                torch.cuda.empty_cache()
 
-                results[impl_name]['latency'].setdefault(batch_size, {})[seq_len] = latency
-                results[impl_name]['memory'].setdefault(batch_size, {})[seq_len] = memory
-
-                print(f"  {impl_name.upper()}: Latency = {latency*1000:.3f} ms, Memory = {memory:.2f} GB")
-
-            # Compare output tensors with detailed stats
-            # print("\nOutput Validation:")
-            # print("------------------")
-            
             # Compare naive vs absorb
-            # print("\nComparing NAIVE vs ABSORB implementations:")
             naive_vs_absorb = compare_tensors_with_stats(
                 ret_vals['naive'], ret_vals['absorb'], 'naive', 'absorb', val_tolerance
             )
             
             # Compare naive vs naive+flash
-            # print("\nComparing NAIVE vs NAIVE+FLASH implementations:")
             naive_vs_flash = compare_tensors_with_stats(
                 ret_vals['naive'], ret_vals['naive+flash'], 'naive', 'naive+flash', val_tolerance
             )
