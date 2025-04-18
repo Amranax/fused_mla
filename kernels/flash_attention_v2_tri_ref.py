@@ -238,7 +238,7 @@ class _attention(torch.autograd.Function):
             k = pad_to_pow2(k)
             q = pad_to_pow2(q)
             HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
-            
+
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
         stage = 3 if causal else 1
@@ -259,13 +259,13 @@ class _attention(torch.autograd.Function):
         # print(f"[DEBUG] k.shape: {k.shape}, k.stride(): {k.stride()}, k.is_contiguous(): {k.is_contiguous()}")
         # print(f"[DEBUG] v.shape: {v.shape}, v.stride(): {v.stride()}, v.is_contiguous(): {v.is_contiguous()}")
         # print(f"[DEBUG] o.shape: {o.shape}, o.stride(): {o.stride()}, o.is_contiguous(): {o.is_contiguous()}")
-        # print(f"[DEBUG] Correct N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM_K}, Z: {Z}, Correct H: {H}")
+        # print(f"[DEBUG] Correct N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM_K}, B: {B}, Correct H: {H}")
         # print(f"[DEBUG] causal: {causal}, sm_scale: {sm_scale}, stage: {stage}")
 
         _attn_fwd[grid](
             q, k, v, sm_scale, M, o, 
-          # Stride arguments - REORDERED to match kernel expectations (Z, H, M/N, K/V)
-          #        (Z=0,     N_CTX=1,         H=2,      HDIM=3)
+          # Stride arguments - REORDERED to match kernel expectations (B, H, M/N, K/V)
+          #        (B=0,     N_CTX=1,         H=2,      HDIM=3)
 
           #   stride_qz,   stride_qh,   stride_qm,   stride_qk,
             q.stride(0), q.stride(2), q.stride(1), q.stride(3),  # Strides for Q
