@@ -49,6 +49,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+
     # loop over k, v and update accumulator
     for start_n in range(lo,  min(hi, N_CTX), BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -112,69 +113,79 @@ def keep(conf):
 @triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
-              stride_qz, stride_qh, stride_qm, stride_qk,  #
-              stride_kz, stride_kh, stride_kn, stride_kk,  #
-              stride_vz, stride_vh, stride_vk, stride_vn,  #
-              stride_oz, stride_oh, stride_om, stride_on,  #
+              stride_qb, stride_qh, stride_qm, stride_qk,  #
+              stride_kb, stride_kh, stride_kn, stride_kk,  #
+              stride_vb, stride_vh, stride_vk, stride_vn,  #
+              stride_ob, stride_oh, stride_om, stride_on,  #
               B, H, N_CTX,  #
-              HEAD_DIM: tl.constexpr,  #
+              HEAD_DIM_QK: tl.constexpr,  #
+              HEAD_DIM_V: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
               STAGE: tl.constexpr  #
               ):
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    # Ensure both the Head Dimension for both Q, K and V is less than N Block
+    tl.static_assert(BLOCK_N <= HEAD_DIM_QK)
+    tl.static_assert(BLOCK_N <= HEAD_DIM_V)
+
     start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
-    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    off_hb = tl.program_id(1)
+
+    off_b = off_hb // H
+    off_h = off_hb % H
+
+    qvk_offset = off_b.to(tl.int64) * stride_qb + off_h.to(tl.int64) * stride_qh
 
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
         base=Q + qvk_offset,
-        shape=(N_CTX, HEAD_DIM),
+        shape=(N_CTX, HEAD_DIM_QK),
         strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+        block_shape=(BLOCK_M, HEAD_DIM_QK),
         order=(1, 0),
     )
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
     V_block_ptr = tl.make_block_ptr(
         base=V + qvk_offset,
-        shape=(N_CTX, HEAD_DIM),
+        shape=(N_CTX, HEAD_DIM_V),
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
+        block_shape=(BLOCK_N, HEAD_DIM_V),
         order=v_order,
     )
     K_block_ptr = tl.make_block_ptr(
         base=K + qvk_offset,
-        shape=(HEAD_DIM, N_CTX),
+        shape=(HEAD_DIM_QK, N_CTX),
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_N),
+        block_shape=(HEAD_DIM_QK, BLOCK_N),
         order=(0, 1),
     )
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
-        shape=(N_CTX, HEAD_DIM),
+        shape=(N_CTX, HEAD_DIM_V),
         strides=(stride_om, stride_on),
         offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+        block_shape=(BLOCK_M, HEAD_DIM_V),
         order=(1, 0),
     )
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
+
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
+
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
+
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
@@ -196,7 +207,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
     # epilogue
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
+    m_ptrs = M + off_hb * N_CTX + offs_m
 
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
@@ -260,7 +271,8 @@ class _attention(torch.autograd.Function):
             o.stride(0), o.stride(2), o.stride(1), o.stride(3),  # Strides for O
             B, H,
             N_CTX=N_CTX,
-            HEAD_DIM=HEAD_DIM_K,
+            HEAD_DIM_QK=HEAD_DIM_K,
+            HEAD_DIM_V=HEAD_DIM_V,
             STAGE=stage,
         )
 
