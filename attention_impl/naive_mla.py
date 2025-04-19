@@ -17,7 +17,7 @@ import math
 from .Shared_Args import Args
 from .General_Layers import *
 
-from kernels.flash_attention_v2_tri_ref import attention as flash_attention
+from kernels.fused_attention_modified_mla import attention as flash_attention
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,9 @@ class MLA(nn.Module):
                     True,                  # causal=True for autoregressive attention
                     self.softmax_scale     # Same scale factor as naive implementation
                 )
+
+                # Reshape back
+                x = x.permute(0, 2, 1, 3)
         else:  # absorb implementation
             wkv_b = self.wkv_b.weight
             if self.wkv_b.scale is not None:

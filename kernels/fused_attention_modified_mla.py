@@ -6,9 +6,7 @@ This is a Triton implementation of the Flash Attention v2 algorithm from Tri Dao
 This original implementation was taken from the Triton-Lange Repo
 
 The code was changed to suit my projects needs
-- Removed TMA support (Limited to H100 GPUs anyway)
-- Removed AMD GPU support
-- Removed Backward pass (To keep its memory constraints usage fair)
+- Removed Backward pass, AMD support, TMA support
 - Added support for different head sizes
 
 
@@ -260,12 +258,12 @@ class _attention(torch.autograd.Function):
         # Grid dim 1 depends on B * H (batch * heads)
         grid = lambda args: (triton.cdiv(N_CTX, args["BLOCK_M"]), B * H, 1)
 
-        print(f"[DEBUG] q.shape: {q.shape}, q.stride(): {q.stride()}, q.is_contiguous(): {q.is_contiguous()}")
-        print(f"[DEBUG] k.shape: {k.shape}, k.stride(): {k.stride()}, k.is_contiguous(): {k.is_contiguous()}")
-        print(f"[DEBUG] v.shape: {v.shape}, v.stride(): {v.stride()}, v.is_contiguous(): {v.is_contiguous()}")
-        print(f"[DEBUG] o.shape: {o.shape}, o.stride(): {o.stride()}, o.is_contiguous(): {o.is_contiguous()}")
-        print(f"[DEBUG] Correct N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM_K}, B: {B}, Correct H: {H}")
-        print(f"[DEBUG] causal: {causal}, sm_scale: {sm_scale}, stage: {stage}")
+        # print(f"[DEBUG] q.shape: {q.shape}, q.stride(): {q.stride()}, q.is_contiguous(): {q.is_contiguous()}")
+        # print(f"[DEBUG] k.shape: {k.shape}, k.stride(): {k.stride()}, k.is_contiguous(): {k.is_contiguous()}")
+        # print(f"[DEBUG] v.shape: {v.shape}, v.stride(): {v.stride()}, v.is_contiguous(): {v.is_contiguous()}")
+        # print(f"[DEBUG] o.shape: {o.shape}, o.stride(): {o.stride()}, o.is_contiguous(): {o.is_contiguous()}")
+        # print(f"[DEBUG] Correct N_CTX: {N_CTX}, HEAD_DIM: {HEAD_DIM_K}, B: {B}, Correct H: {H}")
+        # print(f"[DEBUG] causal: {causal}, sm_scale: {sm_scale}, stage: {stage}")
 
         _attn_fwd[grid](
             q, k, v, sm_scale, M, o, 
@@ -283,12 +281,6 @@ class _attention(torch.autograd.Function):
             HEAD_DIM_V=HEAD_DIM_V,
             STAGE=stage,
         )
-
-        # if HEAD_DIM_V != HEAD_DIM_K:
-        #     # print(f"Truncating o from {HEAD_DIM_K} to {HEAD_DIM_V}")
-        #     # print(f"o shape before: {o.shape}")
-        #     o = o[:, :, :, :HEAD_DIM_V]
-        #     # print(f"o shape after: {o.shape}")
 
         return o
 

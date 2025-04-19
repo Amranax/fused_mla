@@ -420,7 +420,7 @@ def save_incremental_results_to_file(results, output_prefix="benchmark"):
 def main():
     parser = argparse.ArgumentParser(description='Benchmark MLA implementations')
     parser.add_argument('--dtype', type=str, default='bf16', choices=['bf16', 'fp8'], help='Data type for benchmark')
-    parser.add_argument('--min-seq-len', type=int, default=128, help='Minimum sequence length to benchmark')
+    parser.add_argument('--min-seq-len', type=int, default=256, help='Minimum sequence length to benchmark')
     parser.add_argument('--max-seq-len', type=int, default=1024, help='Maximum sequence length to benchmark')
     parser.add_argument('--seq-len-step', type=int, default=256, help='Step size for sequence length')
     parser.add_argument('--batch-sizes', type=int, nargs='+', default=[1, 4], help='Batch sizes to benchmark')
@@ -435,7 +435,7 @@ def main():
         torch.set_default_dtype(torch.bfloat16)
 
     set_seed(42)
-    seq_lengths = list(range(args.min_seq_len, args.max_seq_len + 1, args.seq_len_step))
+    seq_lengths = list(range(args.min_seq_len, args.max_seq_len + args.seq_len_step, args.seq_len_step))
     model_args = Args(dtype=args.dtype)
 
     os.makedirs('benchmark_results', exist_ok=True)
