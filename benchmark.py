@@ -29,28 +29,48 @@ def memory_benchmark(model, input_tensor, start_pos, freqs_cis, mask):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    val = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
+    if hasattr(model, 'k_cache'):
+        model.k_cache.zero_()
+        model.v_cache.zero_()
+    if hasattr(model, 'kv_cache'):
+        model.kv_cache.zero_()
+        model.pe_cache.zero_()
+
+    with torch.no_grad():
+        val = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
     torch.cuda.synchronize()
 
     max_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
     return max_memory, val
 
 
+
 def latency_benchmark(model, input_tensor, start_pos, freqs_cis, mask, warmup=10, repeats=50):
     """Measure model latency"""
+
+    if hasattr(model, 'k_cache'):
+        model.k_cache.zero_()
+        model.v_cache.zero_()
+    if hasattr(model, 'kv_cache'):
+        model.kv_cache.zero_()
+        model.pe_cache.zero_()
+
     for _ in range(warmup):
-        _ = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
+        with torch.no_grad():
+            _ = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
 
     torch.cuda.synchronize()
     start_time = time.time()
 
     for _ in range(repeats):
-        _ = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
+        with torch.no_grad():
+            _ = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
 
     torch.cuda.synchronize()
     end_time = time.time()
 
     return (end_time - start_time) / repeats
+
 
 
 def incremental_token_benchmark(models, embedding_layer, args, batch_size=1, 

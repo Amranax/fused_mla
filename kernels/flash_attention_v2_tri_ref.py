@@ -53,7 +53,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         # -- compute qk ----
-        k = tl.load(K_block_ptr)
+        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
         qk = tl.dot(q, k)
 
         qk = qk * qk_scale # Scale
@@ -81,7 +81,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         acc = acc * alpha[:, None]
 
         # Multiply with V
-        v = tl.load(V_block_ptr)
+        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
         p = p.to(v.dtype)
         acc = tl.dot(p, v, acc)
         
@@ -190,7 +190,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
     qk_scale *= 1.44269504  # 1/log(2)
 
     # load q: it will stay in SRAM throughout
-    q = tl.load(Q_block_ptr)
+    q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
 
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
@@ -231,18 +231,20 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
 
-        # shape constraints
-        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+        # Pad if needed
         HEAD_DIM_V = v.shape[-1] # when v is in float8_e5m2 it is transposed.
-        assert HEAD_DIM_Q == HEAD_DIM_K
+        HEAD_DIM_K = q.shape[-1]
 
-        # Pad
+        if HEAD_DIM_V not in {16, 32, 64, 128, 256}:
+            v = pad_to_pow2(v)
+            HEAD_DIM_V = v.shape[-1]
         if HEAD_DIM_K not in {16, 32, 64, 128, 256}:
             k = pad_to_pow2(k)
             q = pad_to_pow2(q)
-            HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+            HEAD_DIM_K = q.shape[-1]
 
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        assert HEAD_DIM_V in {16, 32, 64, 128, 256}, f"HEAD_DIM_V={HEAD_DIM_V} is invalid"
+        assert HEAD_DIM_K in {16, 32, 64, 128, 256}, f"HEAD_DIM_V={HEAD_DIM_K} is invalid"
 
         stage = 3 if causal else 1
 
