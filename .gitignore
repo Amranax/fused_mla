@@ -1,6 +1,6 @@
 # Local directories
 benchmark_results/
-inten_benchmark_results/
+attention_impl/mla_ref.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

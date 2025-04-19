@@ -1,8 +1,9 @@
 import torch
 
 from .mla_base import MLABase
+from kernels.fused_attention_modified_mla import attention as flash_attention
 
-class NaiveMLA(MLABase):
+class FlashMLA(MLABase):
     def __init__(self, args):
         super().__init__(args)
         self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
@@ -23,11 +24,23 @@ class NaiveMLA(MLABase):
         self.k_cache[:bsz, start_pos:end_pos] = k
         self.v_cache[:bsz, start_pos:end_pos] = v
 
-        scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-        if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).to(x.dtype)
+        cached_k = self.k_cache[:bsz, :end_pos]
+        cached_v = self.v_cache[:bsz, :end_pos]
+        
+        # Reshape for flash_attention kernel
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = cached_k.permute(0, 2, 1, 3).contiguous()
+        v = cached_v .permute(0, 2, 1, 3).contiguous()
 
-        x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
-        x = x.reshape(bsz, seqlen, self.n_heads * self.v_head_dim)
+
+        x = flash_attention(
+            q, 
+            k, 
+            v, 
+            True, 
+            self.softmax_scale
+        )
+
+        x = x.permute(0, 2, 1, 3).reshape(bsz, seqlen, self.n_heads * self.v_head_dim)
+
         return self.wo(x)

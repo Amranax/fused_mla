@@ -2,7 +2,7 @@
 """
 MLA (Multi-Latent Attention) Benchmark
 
-This script benchmarks the naive_mla implementation with various configurations,
+This script benchmarks MLA implementations with various configurations,
 measuring performance metrics like latency, throughput, and memory usage.
 """
 
@@ -13,12 +13,12 @@ import argparse
 import numpy as np
 import os
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
 
 # Local imports
-from attention_impl.naive_mla import MLA
 from attention_impl.Shared_Args import Args
 from attention_impl.General_Layers import precompute_freqs_cis, EmbeddingLayer
+from attention_impl.mla_factory import get_mla
 
 
 def set_seed(seed=42):
@@ -37,49 +37,25 @@ def benchmark_mla(
     n_trials: int = 20,
     device: str = "cuda"
 ) -> Dict[str, float]:
-    """
-    Benchmark MLA with specified configuration
+    """Benchmark MLA with specified configuration"""
     
-    Args:
-        args: MLA configuration args
-        batch_size: Batch size for input
-        seq_len: Sequence length for input
-        n_warmup: Number of warmup iterations
-        n_trials: Number of trials to run for timing
-        device: Device to run on
-        
-    Returns:
-        Dictionary with benchmark results
-    """
-    # Set up MLA model
-    model = MLA(args).to(device).eval()
-    
-    # Create embedding layer
+    model = get_mla(args.attn_impl, args).to(device).eval()
     embedding_layer = EmbeddingLayer(args.vocab_size, args.dim).to(device)
-    
-    # Generate input data
+
     x = torch.randint(0, args.vocab_size, (batch_size, seq_len), device=device)
     x_emb = embedding_layer(x)
-    
-    # Get frequency rotations
+
     freqs_cis = precompute_freqs_cis(args)[:seq_len]
-    
-    # Create causal mask
     mask = torch.full((seq_len, seq_len), float("-inf"), device=device).triu_(1)
-    
-    # Set starting position
     start_pos = 0
-    
-    # Warm-up runs
+
     for _ in range(n_warmup):
         with torch.no_grad():
             _ = model(x_emb, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
-    
-    # Reset memory stats and ensure CUDA synchronization
+
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    
-    # Timed runs
+
     times = []
     for _ in range(n_trials):
         torch.cuda.synchronize()
@@ -88,24 +64,19 @@ def benchmark_mla(
             out = model(x_emb, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
         torch.cuda.synchronize()
         end = time.time()
-        times.append((end - start) * 1000)  # Convert to ms
-    
-    # Get memory usage
-    peak_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)  # Convert to MB
-    
-    # Calculate statistics
+        times.append((end - start) * 1000)
+
+    peak_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
     avg_time = sum(times) / len(times)
     min_time = min(times)
     max_time = max(times)
     std_time = torch.tensor(times).std().item()
-    
-    # Calculate throughput (tokens/sec)
     tokens_per_sec = (batch_size * seq_len) / (avg_time / 1000)
-    
-    # Get sample value stats from output for validation
+
     output_mean = out.mean().item()
     output_std = out.std().item()
-    
+
     return {
         "attn_impl": args.attn_impl,
         "dtype": args.dtype,
@@ -139,32 +110,15 @@ def sweep_mla_configs(
     device: str = "cuda",
     output_dir: str = "mla_benchmark_results"
 ) -> pd.DataFrame:
-    """
-    Run benchmarks across different MLA configurations
-    
-    Args:
-        dtype: Data type ("bf16" or "fp8")
-        attn_impls: List of attention implementations to test
-        batch_sizes: List of batch sizes to test
-        seq_lengths: List of sequence lengths to test
-        n_heads_list: List of head counts to test
-        head_dims: List of (qk_rope_head_dim, qk_nope_head_dim, v_head_dim) tuples to test
-        n_warmup: Number of warmup iterations
-        n_trials: Number of trials for each benchmark
-        device: Device to run on
-        output_dir: Directory to save results
-        
-    Returns:
-        DataFrame with all benchmark results
-    """
+    """Run benchmarks across different MLA configurations"""
+
     os.makedirs(output_dir, exist_ok=True)
-    
     results = []
     total_configs = len(attn_impls) * len(batch_sizes) * len(seq_lengths) * len(n_heads_list) * len(head_dims)
     config_count = 0
-    
+
     print(f"Running {total_configs} MLA configurations...")
-    
+
     for attn_impl in attn_impls:
         for n_heads in n_heads_list:
             for qk_rope_dim, qk_nope_dim, v_dim in head_dims:
@@ -174,12 +128,10 @@ def sweep_mla_configs(
                         print(f"[{config_count}/{total_configs}] Testing config: attn_impl={attn_impl}, "
                               f"n_heads={n_heads}, head_dims=({qk_rope_dim},{qk_nope_dim},{v_dim}), "
                               f"batch_size={batch_size}, seq_len={seq_len}")
-                        
-                        # Calculate model dimension
+
                         head_dim = qk_rope_dim + qk_nope_dim
                         dim = n_heads * head_dim
-                        
-                        # Set args for this configuration
+
                         args = Args(
                             attn_impl=attn_impl,
                             dtype=dtype,
@@ -188,10 +140,9 @@ def sweep_mla_configs(
                             qk_rope_head_dim=qk_rope_dim,
                             qk_nope_head_dim=qk_nope_dim,
                             v_head_dim=v_dim,
-                            max_seq_len=seq_len * 2  # Extra buffer for caching
+                            max_seq_len=seq_len * 2
                         )
-                        
-                        # Run benchmark
+
                         try:
                             result = benchmark_mla(
                                 args=args,
@@ -204,7 +155,6 @@ def sweep_mla_configs(
                             results.append(result)
                         except Exception as e:
                             print(f"Error benchmarking configuration: {e}")
-                            # Add failed configuration with error message
                             results.append({
                                 "attn_impl": attn_impl,
                                 "dtype": dtype,
@@ -217,18 +167,14 @@ def sweep_mla_configs(
                                 "seq_len": seq_len,
                                 "error": str(e)
                             })
-                        
-                        # Save intermediate results
+
                         df = pd.DataFrame(results)
                         df.to_csv(f"{output_dir}/mla_benchmark_partial.csv", index=False)
-    
-    # Create final results dataframe
+
     df = pd.DataFrame(results)
     df.to_csv(f"{output_dir}/mla_benchmark_results.csv", index=False)
     print(f"Benchmark complete. Results saved to {output_dir}/mla_benchmark_results.csv")
-    
     return df
-
 
 def plot_latency_comparison(df, output_dir):
     """Plot latency comparison across different implementations"""
@@ -658,18 +604,17 @@ def generate_summary_report(df, output_file):
                 f.write(f"narrows. At sequence length {min_seq}, the fastest implementation is {min_seq_gap:.2f}x faster than the slowest, ")
                 f.write(f"while at sequence length {max_seq}, the gap decreases to {max_seq_gap:.2f}x.\n")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark MLA implementations with different configurations")
     parser.add_argument("--dtype", type=str, choices=["bf16", "fp8"], default="bf16",
                        help="Data type to use for benchmarking")
-    parser.add_argument("--implementations", type=str, nargs="+", 
+    parser.add_argument("--implementations", type=str, nargs="+",
                         default=["naive", "absorb", "naive+flash"],
                         help="MLA implementations to benchmark")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4],
                        help="Batch sizes to benchmark")
-    parser.add_argument("--seq-lengths", type=int, nargs="+", 
-                        default=[128, 256, 512, 1024, 2048],
+    parser.add_argument("--seq-lengths", type=int, nargs="+",
+                        default=[2**i for i in range(8, 12)],
                         help="Sequence lengths to benchmark")
     parser.add_argument("--heads", type=int, nargs="+", default=[16],
                        help="Number of heads to benchmark")
@@ -683,28 +628,21 @@ if __name__ == "__main__":
                        help="Number of trials for each benchmark")
     parser.add_argument("--warmup", type=int, default=5,
                        help="Number of warmup iterations")
-    parser.add_argument("--output-dir", type=str, default="inten_benchmark_results",
+    parser.add_argument("--output-dir", type=str, default="benchmark_results",
                        help="Directory to save results")
-    
+
     args = parser.parse_args()
-    
+
     torch.set_default_device('cuda')
     if args.dtype == 'bf16':
         torch.set_default_dtype(torch.bfloat16)
 
-    # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda":
-        print("WARNING: CUDA not available, benchmarks will run on CPU")
-    
-    # Create head dimension configurations
-    head_dims = []
-    for rope_dim in args.rope_dims:
-        for nope_dim in args.nope_dims:
-            for v_dim in args.v_dims:
-                head_dims.append((rope_dim, nope_dim, v_dim))
-    
-    # Run benchmarks
+        assert False & "WARNING: CUDA not available, benchmarks will run on CPU"
+
+    head_dims = [(r, n, v) for r in args.rope_dims for n in args.nope_dims for v in args.v_dims]
+
     print(f"Running benchmarks with {args.dtype} precision...")
     df = sweep_mla_configs(
         dtype=args.dtype,
@@ -718,7 +656,7 @@ if __name__ == "__main__":
         device=device,
         output_dir=args.output_dir
     )
-    
+
     # Generate plots
     print("Generating visualization plots...")
     plot_latency_comparison(df, args.output_dir)
@@ -728,5 +666,5 @@ if __name__ == "__main__":
     # Generate summary report
     print("Generating summary report...")
     generate_summary_report(df, f"{args.output_dir}/mla_benchmark_report.md")
-    
+
     print(f"Benchmark completed. Results and visualizations saved to '{args.output_dir}' directory.")
