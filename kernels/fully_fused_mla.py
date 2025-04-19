@@ -252,8 +252,8 @@ class _MLAttentionCore(torch.autograd.Function):
         pe_cache = pe_cache.contiguous() # (B , S_tot , RDim )
         w_v      = w_v.contiguous()      # (H , V , K )
 
-        B, H, S_q, C1        = q_nope.shape
-        _, _, _, R           = q_pe.shape
+        B, H, S_q, NoDim        = q_nope.shape
+        _, _, _, RDim           = q_pe.shape
         _, S_tot, K          = kv_cache.shape
         _, V, _              = w_v.shape
 
@@ -286,8 +286,8 @@ class _MLAttentionCore(torch.autograd.Function):
 
             # ---- constexpr ----
             KV_RANK=K,
-            QK_NOPE_DIM_PROJ=C1,
-            QK_ROPE_DIM=R,
+            QK_NOPE_DIM_PROJ=NoDim,
+            QK_ROPE_DIM=RDim,
             V_HEAD_DIM=V,
 
             causal=causal,

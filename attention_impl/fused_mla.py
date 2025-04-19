@@ -67,9 +67,9 @@ class FusedMLA(MLABase):
 
         # de‑quantise if necessary 
         if self.wkv_b.scale is None:
-            w_v = self.wkv_b.weight
+            wkv_b = self.wkv_b.weight
         else:
-            w_v = weight_dequant(                   # noqa: F405
+            wkv_b = weight_dequant(                   # noqa: F405
                 self.wkv_b.weight,
                 self.wkv_b.scale,
                 block_size,
@@ -81,7 +81,7 @@ class FusedMLA(MLABase):
             q_pe_proj,             # (B , H , S_q , RDim )
             kv_cache_slice,        # (B , S_tot , K)
             pe_cache_slice,        # (B , S_tot , RDim)
-            w_v,                   # (H , V , K)
+            wkv_b,                 # (LRank, H*(NoDim + Vdim))
             mask is None,          # causal flag
             self.softmax_scale,
             start_pos,
