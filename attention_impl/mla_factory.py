@@ -12,5 +12,8 @@ def get_mla(attn_impl: str, args):
     elif attn_impl == "absorb":
         from .absorb_mla import AbsorbMLA
         return AbsorbMLA(args)
+    elif attn_impl == "fused":
+        from .fused_mla import FusedMLA 
+        return FusedMLA(args)
     else:
         raise ValueError(f"Unsupported attn_impl: {attn_impl}")

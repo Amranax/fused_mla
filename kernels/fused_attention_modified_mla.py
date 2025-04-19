@@ -92,10 +92,8 @@ def _attn_fwd_inner(
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=1, num_warps=4),
-        # Add configs with more stages/warps if desired
-        # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=3, num_warps=8),
     ],
-    key=['N_CTX', 'HEAD_DIM_QK', 'HEAD_DIM_V', 'causal'] # Add causal to key
+    key=['N_CTX', 'HEAD_DIM_QK', 'HEAD_DIM_V', 'causal']
 )
 @triton.jit
 def _attn_fwd(

@@ -147,6 +147,7 @@ def run_benchmarks(args, seq_lengths, batch_sizes, val_tolerance=1.5e-2):
                 'naive': Args(dtype=args.dtype, max_seq_len=seq_len + 128),
                 'absorb': Args(dtype=args.dtype, max_seq_len=seq_len + 128),
                 'naive+flash': Args(dtype=args.dtype, max_seq_len=seq_len + 128),
+                'fused': Args(dtype=args.dtype, max_seq_len=seq_len + 128),
             }
 
             # Initialize all models with the same weights
