@@ -111,16 +111,17 @@ class MLA(nn.Module):
                 x = torch.einsum("bsht,bthd->bshd", scores, cached_v)
                 
             else:  # naive+flash
+
+                # [bsz, seqlen, n_heads, head_dim] -> [bsz, n_heads, seqlen, head_dim]
+                q_cont = q.permute(0, 2, 1, 3).contiguous()
+                k_cont = cached_k.permute(0, 2, 1, 3).contiguous()
+                v_cont = cached_v.permute(0, 2, 1, 3).contiguous()
+
                 # Use flash attention implementation
-                # Ensure tensors are contiguous for optimal performance
-                q_cont = q.contiguous()
-                k_cont = cached_k.contiguous()
-                v_cont = cached_v.contiguous()
-                
                 x = flash_attention(
-                    q_cont,                # Query [bsz, seqlen, n_heads, head_dim]
-                    k_cont,                # Key [bsz, end_pos, n_heads, head_dim]
-                    v_cont,                # Value [bsz, end_pos, n_heads, head_dim]
+                    q_cont,                # Query 
+                    k_cont,                # Key 
+                    v_cont,                # Value 
                     True,                  # causal=True for autoregressive attention
                     self.softmax_scale     # Same scale factor as naive implementation
                 )

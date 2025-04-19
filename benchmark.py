@@ -59,9 +59,9 @@ def latency_benchmark(model, input_tensor, start_pos, freqs_cis, mask, warmup=10
         with torch.no_grad():
             _ = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
 
-    torch.cuda.synchronize()
-    start_time = time.time()
+        torch.cuda.synchronize()
 
+    start_time = time.time()
     for _ in range(repeats):
         with torch.no_grad():
             _ = model(input_tensor, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
