@@ -244,7 +244,6 @@ def main():
     parser.add_argument('--seq-len-step', type=int, default=256, help='Step size for sequence length')
     parser.add_argument('--batch-sizes', type=int, nargs='+', default=[1, 4], help='Batch sizes to benchmark')
     parser.add_argument('--output', type=str, default='', help='Output file prefix')
-    parser.add_argument('--standard-only', action='store_true', help='Run only the standard benchmark')
     parser.add_argument('--tolerance', type=float, default=1.5e-2, help='Tolerance for tensor comparison')
     args = parser.parse_args()
 

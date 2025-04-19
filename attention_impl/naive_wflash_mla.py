@@ -32,7 +32,6 @@ class FlashMLA(MLABase):
         k = cached_k.permute(0, 2, 1, 3).contiguous()
         v = cached_v .permute(0, 2, 1, 3).contiguous()
 
-
         x = flash_attention(
             q, 
             k, 

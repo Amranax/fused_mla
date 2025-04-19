@@ -27,68 +27,56 @@ DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
-                    K_block_ptr, V_block_ptr,  #
-                    start_m, qk_scale,  #
+                    k_base, v_base,     #
+                    start_n_offset, qk_scale,  #
+                    stride_kk, stride_kn, stride_vk, stride_vn,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM_QK: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr):
-    # Causal = True (1st Stage)
-    if STAGE == 1:
-        lo, hi = 0, start_m * BLOCK_M
-    # Causal = True (1st Stage)
-    elif STAGE == 2:
-        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
-        lo = tl.multiple_of(lo, BLOCK_M)
-    # Causal = False
-    else:
-        lo, hi = 0, N_CTX
-        
-    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
-    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    
+    for start_n in range(start_n_offset, min(start_n_offset + BLOCK_M, N_CTX), BLOCK_N):
+        start_n_aligned = tl.multiple_of(start_n, BLOCK_N)
 
-    # loop over k, v and update accumulator
-    for start_n in range(lo,  min(hi, N_CTX), BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # K load
+        k_row = tl.arange(0, HEAD_DIM_QK)
+        k_col = offs_n + start_n_aligned
+        k_mask = k_col[None, :] < N_CTX
+        k_ptrs = k_base + k_row[:, None] * stride_kk + k_col[None, :] * stride_kn
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
 
-        # -- compute qk ----
-        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+        # qk
         qk = tl.dot(q, k)
-
-        qk = qk * qk_scale # Scale
+        qk *= qk_scale
 
         if STAGE == 2:
-            # Apply masking for diagonal part
-            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-            qk += tl.where(mask, 0, -1.0e6)
+            causal_mask = offs_m[:, None] >= k_col[None, :]
+            qk = tl.where(causal_mask, qk, -1e6)
 
-        # Remove local max to prevent overflow
+        # logsumexp-style
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk -= m_ij[:, None]
-
-        # Numerator    
-        p = tl.math.exp2(qk)
+        qk = qk - m_ij[:, None]
+        p = tl.exp2(qk)
         l_ij = tl.sum(p, 1)
-        
-        # Scaling factor based on old and new max
-        alpha = tl.math.exp2(m_i - m_ij)
-        
-        # Update running denominator sum
+        alpha = tl.exp2(m_i - m_ij)
         l_i = l_i * alpha + l_ij
-        
-        # Scale previous acc
         acc = acc * alpha[:, None]
 
-        # Multiply with V
-        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+        # V load
+        v_row = k_col
+        v_col = tl.arange(0, acc.shape[1])
+        v_mask = v_row[:, None] < N_CTX
+        v_ptrs = v_base + v_row[:, None] * stride_vk + v_col[None, :] * stride_vn
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+
+        # acc update
         p = p.to(v.dtype)
         acc = tl.dot(p, v, acc)
-        
-        # Update
+
+        # m_i update
         m_i = m_ij
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
 
     return acc, l_i, m_i
+
 
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
@@ -128,93 +116,62 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
               BLOCK_N: tl.constexpr,  #
               STAGE: tl.constexpr  #
               ):
-    # Ensure both the Head Dimension for both Q, K and V is less than N Block
-    tl.static_assert(BLOCK_N <= HEAD_DIM_QK)
-    tl.static_assert(BLOCK_N <= HEAD_DIM_V)
 
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
-
     off_b = off_hb // H
     off_h = off_hb % H
 
-    qvk_offset = off_b.to(tl.int64) * stride_qb + off_h.to(tl.int64) * stride_qh
+    # Base offsets
+    q_offset = Q + off_b * stride_qb + off_h * stride_qh
+    k_offset = K + off_b * stride_kb + off_h * stride_kh
+    v_offset = V + off_b * stride_vb + off_h * stride_vh
+    o_offset = Out + off_b * stride_ob + off_h * stride_oh
 
-    # block pointers
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
-        shape=(N_CTX, HEAD_DIM_QK),
-        strides=(stride_qm, stride_qk),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM_QK),
-        order=(1, 0),
-    )
-    v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
-    V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
-        shape=(N_CTX, HEAD_DIM_V),
-        strides=(stride_vk, stride_vn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM_V),
-        order=v_order,
-    )
-    K_block_ptr = tl.make_block_ptr(
-        base=K + qvk_offset,
-        shape=(HEAD_DIM_QK, N_CTX),
-        strides=(stride_kk, stride_kn),
-        offsets=(0, 0),
-        block_shape=(HEAD_DIM_QK, BLOCK_N),
-        order=(1, 0),
-    )
-    O_block_ptr = tl.make_block_ptr(
-        base=Out + qvk_offset,
-        shape=(N_CTX, HEAD_DIM_V),
-        strides=(stride_om, stride_on),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM_V),
-        order=(1, 0),
-    )
-    # initialize offsets
+    # index helpers
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+    offs_d_qk = tl.arange(0, HEAD_DIM_QK)
+    offs_d_v = tl.arange(0, HEAD_DIM_V)
 
-    # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    # Load q
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
+    q = tl.load(q_ptrs, mask=(offs_m[:, None] < N_CTX), other=0.0)
+
+    # Init accumulators
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
 
-    # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
 
-    # load q: it will stay in SRAM throughout
-    q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
-
-    # stage 1: off-band
-    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
-    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
+    # STAGE 1 = causal off-band
+    # STAGE 2 = causal on-band
+    # STAGE 3 = full attention
     if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM_QK, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX  #
-                                        )
-    # stage 2: on-band
-    if STAGE & 2:
-        # barrier makes it easier for compielr to schedule the
-        # two loops independently
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM_QK, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX  #
-                                        )
-    # epilogue
-    m_i += tl.math.log2(l_i)
-    acc = acc / l_i[:, None]
-    m_ptrs = M + off_hb * N_CTX + offs_m
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, k_offset, v_offset,
+                                        0, qk_scale,
+                                        stride_kk, stride_kn, stride_vk, stride_vn,
+                                        BLOCK_M, HEAD_DIM_QK, BLOCK_N,
+                                        3 if STAGE == 3 else 1, offs_m, offs_n, N_CTX)
 
+    if STAGE & 2:
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, k_offset, v_offset,
+                                        start_m * BLOCK_M, qk_scale,
+                                        stride_kk, stride_kn, stride_vk, stride_vn,
+                                        BLOCK_M, HEAD_DIM_QK, BLOCK_N,
+                                        2, offs_m, offs_n, N_CTX)
+
+    # Finalize output
+    m_i += tl.log2(l_i)
+    acc /= l_i[:, None]
+
+    m_ptrs = M + off_hb * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+
+    o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
 
 def pad_to_pow2(x):
     head_dim = x.shape[-1]
@@ -224,7 +181,10 @@ def pad_to_pow2(x):
         padding = (0, pad_len)  # Only pad the last dimension
         x = F.pad(x, padding, value=0).contiguous()
     return x
-    
+
+def unpad_from_pow2(x, orig_head_dim):
+    return x[..., :orig_head_dim].contiguous() # Not necessary to make contigous 
+
 class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
@@ -238,9 +198,12 @@ class _attention(torch.autograd.Function):
         HEAD_DIM_V = v.shape[3] # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_K = q.shape[3]
 
+        orig_head_dim_v = HEAD_DIM_V
         if HEAD_DIM_V not in {16, 32, 64, 128, 256}:
             v = pad_to_pow2(v)
             HEAD_DIM_V = v.shape[3]
+
+        orig_head_dim_k = HEAD_DIM_K
         if HEAD_DIM_K not in {16, 32, 64, 128, 256}:
             k = pad_to_pow2(k)
             q = pad_to_pow2(q)
@@ -281,6 +244,13 @@ class _attention(torch.autograd.Function):
             HEAD_DIM_V=HEAD_DIM_V,
             STAGE=stage,
         )
+        # Truncate q,k,v if they were changed
+        if orig_head_dim_v != HEAD_DIM_V:
+            v = unpad_from_pow2(v, orig_head_dim_v)
+            o = unpad_from_pow2(o, orig_head_dim_v)
+        if orig_head_dim_k != HEAD_DIM_K:
+            q = unpad_from_pow2(v, orig_head_dim_k)
+            k = unpad_from_pow2(v, orig_head_dim_k)
 
         return o
 
