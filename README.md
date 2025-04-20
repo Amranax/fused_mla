@@ -1,5 +1,3 @@
-# fused_mla
-Fused Multi-Latent-Attention-Kernel
 # Fused Multi-Latent Attention Kernel (FusedMLA)
 
 **Project Members:** 
