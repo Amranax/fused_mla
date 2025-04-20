@@ -1,7 +1,4 @@
-# fused_mla.py
-import math
 import torch
-import torch.nn.functional as F
 
 import triton
 import triton.language as tl
@@ -25,8 +22,8 @@ def _mla_attn_core_fwd_inner(
     BLOCK_N: tl.constexpr,
     STAGE: tl.constexpr,           # 1 = prefix, 2 = diagonal, 3 = full
 ):
-    """Inner loop – streams blocks of K / V from the caches and updates
-    the running soft‑max statistics plus the accumulator `acc`.
+    """Inner loop streams blocks of K / V from the caches and updates
+    the running softmax statistics plus the accumulator `acc`.
     """
 
     # -----------------------------------------------------------------
@@ -106,25 +103,22 @@ def _mla_attn_core_fwd_inner(
 )
 @triton.jit
 def _mla_attn_core_fwd(
-    # ---- tensors ------------------------------------------------------
-    Q_NOPE, Q_PE,                   # (B , H , S_q , C1)   · (B , H , S_q , R)
-    KV_CACHE, PE_CACHE,             # (B , S_tot , K)      · (B , S_tot , R)
-    W_V,                            # (H , V , K)
-    OUT,                            # (B , H , S_q , V)
+    # Tensors
+    Q_NOPE, Q_PE, KV_CACHE, PE_CACHE, W_KV, OUT,
 
-    # ---- strides ------------------------------------------------------
-    s_qnp_b, s_qnp_h, s_qnp_s, s_qnp_c,
-    s_qpe_b, s_qpe_h, s_qpe_s, s_qpe_r,
-    s_kv_b,  s_kv_s,  s_kv_k,
-    s_pe_b,  s_pe_s,  s_pe_r,
-    s_wv_h,  s_wv_v,  s_wv_k,
-    s_o_b,   s_o_h,   s_o_s,   s_o_v,
+    # Strides
+    s_qnp_b, s_qnp_h, s_qnp_n, s_qnp_nd,
+    s_qpe_b, s_qpe_h, s_qpe_n, s_qpe_rd,
+    s_kv_b,  s_kv_n,  s_kv_r,
+    s_pe_b,  s_pe_n,  s_pe_rd,
+    s_wkv_t,  s_wkv_r,
+    s_o_b,   s_o_h,   s_o_n,   s_o_vd,
 
-    # ---- sizes & params ----------------------------------------------
-    B, H, N_CTX_Q, N_CTX_TOTAL,
-    START_POS, SM_SCALE,
+    # Sizes
+    B, H, N_CTX, N_CTX_TOTAL,
+    SM_SCALE,
 
-    # ---- constexpr ----------------------------------------------------
+    # Consts
     KV_RANK:            tl.constexpr,
     QK_NOPE_DIM_PROJ:   tl.constexpr,
     QK_ROPE_DIM:        tl.constexpr,
@@ -133,23 +127,19 @@ def _mla_attn_core_fwd(
     BLOCK_N:            tl.constexpr,
     causal:             tl.constexpr,
 ):
-    # ------------------------------------------------------------------
-    # 0. Derive program offsets
-    # ------------------------------------------------------------------
-    start_m  = tl.program_id(0)                       # which M‑block
-    off_bh   = tl.program_id(1)                       # (batch · head)
-    b        = off_bh // H
-    h        = off_bh %  H
+    
+    start_m  = tl.program_id(0)                       
+    off_bh   = tl.program_id(1) 
+    b        = off_bh // H # Which Batch are we in
+    h        = off_bh %  H # Which head are we in
 
-    # ------------------------------------------------------------------
-    # 1. Base pointers
-    # ------------------------------------------------------------------
-    q_nope_ptr = Q_NOPE  + b * s_qnp_b + h * s_qnp_h + start_m * BLOCK_M * s_qnp_s
-    q_pe_ptr   = Q_PE    + b * s_qpe_b + h * s_qpe_h + start_m * BLOCK_M * s_qpe_s
+    # Ptr arithmetic :)
+    q_nope_ptr = Q_NOPE  + b * s_qnp_b + h * s_qnp_h + start_m * BLOCK_M * s_qnp_n
+    q_pe_ptr   = Q_PE    + b * s_qpe_b + h * s_qpe_h + start_m * BLOCK_M * s_qpe_n
     kv_ptr     = KV_CACHE + b * s_kv_b
     pe_ptr     = PE_CACHE + b * s_pe_b
-    o_ptr      = OUT      + b * s_o_b  + h * s_o_h  + start_m * BLOCK_M * s_o_s
-    wv_ptr     = W_V      + h * s_wv_h
+    o_ptr      = OUT      + b * s_o_b  + h * s_o_h  + start_m * BLOCK_M * s_o_n
+    wv_ptr     = W_KV      + h * s_wkv_t
 
     # ------------------------------------------------------------------
     # 2. Load this M‑block of Q
@@ -158,16 +148,16 @@ def _mla_attn_core_fwd(
     offs_c1     = tl.arange(0, tl.next_power_of_2(QK_NOPE_DIM_PROJ))
     offs_r      = tl.arange(0, tl.next_power_of_2(QK_ROPE_DIM))
 
-    qnope_msk = (offs_m[:, None] < N_CTX_Q) & (offs_c1[None, :] < QK_NOPE_DIM_PROJ)
-    qpe_msk   = (offs_m[:, None] < N_CTX_Q) & (offs_r [None, :] < QK_ROPE_DIM)
+    qnope_msk = (offs_m[:, None] < N_CTX) & (offs_c1[None, :] < QK_NOPE_DIM_PROJ)
+    qpe_msk   = (offs_m[:, None] < N_CTX) & (offs_r [None, :] < QK_ROPE_DIM)
 
     q_nope_blk = tl.load(
-        q_nope_ptr + offs_m[:, None] * s_qnp_s + offs_c1[None, :] * s_qnp_c,
+        q_nope_ptr + offs_m[:, None] * s_qnp_n + offs_c1[None, :] * s_qnp_nd,
         mask=qnope_msk, other=0.0,
     )                                                  # (M , C1)
 
     q_pe_blk   = tl.load(
-        q_pe_ptr + offs_m[:, None] * s_qpe_s + offs_r[None, :] * s_qpe_r,
+        q_pe_ptr + offs_m[:, None] * s_qpe_n + offs_r[None, :] * s_qpe_rd,
         mask=qpe_msk, other=0.0,
     )                                                  # (M , R)
 
@@ -189,9 +179,9 @@ def _mla_attn_core_fwd(
             acc, l_i, m_i,
             q_nope_blk, q_pe_blk,
             kv_ptr, pe_ptr,
-            s_kv_s, s_kv_k, s_pe_s, s_pe_r,
+            s_kv_n, s_kv_r, s_pe_n, s_pe_rd,
             start_m, SM_SCALE, START_POS,
-            N_CTX_Q, N_CTX_TOTAL,
+            N_CTX, N_CTX_TOTAL,
             KV_RANK, QK_ROPE_DIM,
             BLOCK_M, BLOCK_N,
             STAGE=stage1,
@@ -202,9 +192,9 @@ def _mla_attn_core_fwd(
             acc, l_i, m_i,
             q_nope_blk, q_pe_blk,
             kv_ptr, pe_ptr,
-            s_kv_s, s_kv_k, s_pe_s, s_pe_r,
+            s_kv_n, s_kv_r, s_pe_n, s_pe_rd,
             start_m, SM_SCALE, START_POS,
-            N_CTX_Q, N_CTX_TOTAL,
+            N_CTX, N_CTX_TOTAL,
             KV_RANK, QK_ROPE_DIM,
             BLOCK_M, BLOCK_N,
             STAGE=stage2,
@@ -220,7 +210,7 @@ def _mla_attn_core_fwd(
     offs_k  = tl.arange(0, tl.next_power_of_2(KV_RANK))
     wv_msk  = (offs_v[:, None] < V_HEAD_DIM) & (offs_k[None, :] < KV_RANK)
     w_v_h   = tl.load(
-        wv_ptr + offs_v[:, None] * s_wv_v + offs_k[None, :] * s_wv_k,
+        wv_ptr + offs_v[:, None] * s_wkv_r + offs_k[None, :] * s_wv_k,
         mask=wv_msk, other=0.0,
     ).to(acc.dtype)                                     # (V , K)
 
@@ -228,10 +218,10 @@ def _mla_attn_core_fwd(
 
     # ---- store -------------------------------------------------------
     offs_v_ = tl.arange(0, tl.next_power_of_2(V_HEAD_DIM))
-    out_msk = (offs_m[:, None] < N_CTX_Q) & (offs_v_[None, :] < V_HEAD_DIM)
+    out_msk = (offs_m[:, None] < N_CTX) & (offs_v_[None, :] < V_HEAD_DIM)
 
     tl.store(
-        o_ptr + offs_m[:, None] * s_o_s + offs_v_[None, :] * s_o_v,
+        o_ptr + offs_m[:, None] * s_o_n + offs_v_[None, :] * s_o_vd,
         out_blk.to(Q_NOPE.dtype),
         mask=out_msk,
     )
@@ -242,54 +232,70 @@ def _mla_attn_core_fwd(
 # ---------------------------------------------------------------------
 class _MLAttentionCore(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q_nope, q_pe, kv_cache, pe_cache, w_v,
-                causal: bool, sm_scale: float, start_pos: int):
+    def forward(ctx, q_nope, q_pe, kv_cache, pe_cache, w_kv,
+                causal: bool, sm_scale: float):
 
         # Ensure contigousy
-        q_nope   = q_nope.contiguous()   # (B , H , S_q , NoDim)
-        q_pe     = q_pe.contiguous()     # (B , H , S_q , RDim )
-        kv_cache = kv_cache.contiguous() # (B , S_tot , K )
-        pe_cache = pe_cache.contiguous() # (B , S_tot , RDim )
-        w_v      = w_v.contiguous()      # (H , V , K )
+        q_nope   = q_nope.contiguous()   # (B , H , N_ctx , NoDim)
+        q_pe     = q_pe.contiguous()     # (B , H , N_ctx , RDim )
 
-        B, H, S_q, NoDim        = q_nope.shape
-        _, _, _, RDim           = q_pe.shape
-        _, S_tot, K          = kv_cache.shape
-        _, V, _              = w_v.shape
+        kv_cache = kv_cache.contiguous() # (B , N_total , LRank)
+        pe_cache = pe_cache.contiguous() # (B , N_total , RDim)
+
+        w_kv      = w_kv.contiguous()      # (H*(NoDim + Vdim), LRank )
+
+        B, H, N, NoDim        = q_nope.shape
+        _, _, _, RDim         = q_pe.shape
+        _, N_tot, LRank        = kv_cache.shape
+        temp, _           = w_kv.shape
+        
+        Vdim = int((temp / H) - NoDim)
+
+        print(f"[DEBUG] q_nope.shape:   {q_nope.shape}, is_contiguous: {q_nope.is_contiguous()}")
+        print(f"[DEBUG] q_pe.shape:     {q_pe.shape}, is_contiguous: {q_pe.is_contiguous()}")
+        print(f"[DEBUG] kv_cache.shape: {kv_cache.shape}, is_contiguous: {kv_cache.is_contiguous()}")
+        print(f"[DEBUG] pe_cache.shape: {pe_cache.shape}, is_contiguous: {pe_cache.is_contiguous()}")
+        print(f"[DEBUG] w_kv.shape:     {w_kv.shape}, is_contiguous: {w_kv.is_contiguous()}")
+
+        print(f"[DEBUG] Batch size (B): {B}")
+        print(f"[DEBUG] Num heads (H):  {H}")
+        print(f"[DEBUG] Context len (N): {N}")
+        print(f"[DEBUG] NoDim: {NoDim}, RDim: {RDim}")
+        print(f"[DEBUG] N_total: {N_tot}, LRank: {LRank}")
+        print(f"[DEBUG] LRank: {LRank}, temp: {temp}")
+        print(f"[DEBUG] Vdim: {Vdim}")
 
         out = torch.empty(
-            (B, H, S_q, V),
+            (B, H, N, Vdim),
             dtype=q_nope.dtype,
-            device=q_nope.device,
         )
 
         grid = lambda meta: (
-            triton.cdiv(S_q, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_M"]),
             B * H,
         )
 
         _mla_attn_core_fwd[grid](
             # ---- tensors ----
-            q_nope, q_pe, kv_cache, pe_cache, w_v, out,
+            q_nope, q_pe, kv_cache, pe_cache, w_kv, out,
 
-            # ---- strides ----
-            *q_nope.stride(),         # 4 ints
-            *q_pe.stride(),           # 4
-            *kv_cache.stride(),       # 3
-            *pe_cache.stride(),       # 3
-            *w_v.stride(),            # 3
-            *out.stride(),            # 4
+            # Strides
+            q_nope.stride(0), q_nope.stride(1), q_nope.stride(2), q_nope.stride(3),
+            q_pe.stride(0),    q_pe.stride(1),    q_pe.stride(2),   q_pe.stride(3),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            pe_cache.stride(0), pe_cache.stride(1), pe_cache.stride(2),
+            w_kv.stride(0),         w_kv.stride(1),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
 
-            # ---- sizes & params ----
-            B, H, S_q, S_tot,
-            start_pos, sm_scale,
+            # Sizes
+            B, H, N, N_tot,
+            sm_scale,
 
-            # ---- constexpr ----
-            KV_RANK=K,
+            # Consts
+            KV_RANK=LRank,
             QK_NOPE_DIM_PROJ=NoDim,
             QK_ROPE_DIM=RDim,
-            V_HEAD_DIM=V,
-
+            V_HEAD_DIM=Vdim,
             causal=causal,
         )
 
