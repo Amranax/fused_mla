@@ -43,8 +43,8 @@ def _mla_attn_core_fwd_inner(
     # 2. Constant offset tensors
     # -----------------------------------------------------------------
     offs_m      = tl.arange(0, BLOCK_M)                                   # query row indices
-    offs_k_rank = tl.arange(0, tl.next_power_of_2(KV_RANK))               #   … KV rank
-    offs_pe_r   = tl.arange(0, tl.next_power_of_2(QK_ROPE_DIM))           #   … PE rank
+    offs_k_rank = tl.arange(0, tl.minimum(KV_RANK, 256))                  #   … KV rank
+    offs_pe_r   = tl.arange(0, tl.minimum(QK_ROPE_DIM, 256))              #   … PE rank
 
     # -----------------------------------------------------------------
     # 3. Iterate over key / value blocks
@@ -98,7 +98,7 @@ def _mla_attn_core_fwd_inner(
     key=[
         "N_CTX_Q", "N_CTX_TOTAL",
         "KV_RANK", "QK_NOPE_DIM_PROJ", "QK_ROPE_DIM",
-        "causal",
+        "V_HEAD_DIM", "causal",
     ],
 )
 @triton.jit
@@ -111,12 +111,12 @@ def _mla_attn_core_fwd(
     s_qpe_b, s_qpe_h, s_qpe_n, s_qpe_rd,
     s_kv_b,  s_kv_n,  s_kv_r,
     s_pe_b,  s_pe_n,  s_pe_rd,
-    s_wkv_t,  s_wkv_r,
+    s_wkv_r, s_wkv_c,
     s_o_b,   s_o_h,   s_o_n,   s_o_vd,
 
     # Sizes
-    B, H, N_CTX, N_CTX_TOTAL,
-    SM_SCALE,
+    B, H, N_CTX_Q, N_CTX_TOTAL,
+    SM_SCALE, START_POS,
 
     # Consts
     KV_RANK:            tl.constexpr,
@@ -133,23 +133,27 @@ def _mla_attn_core_fwd(
     b        = off_bh // H # Which Batch are we in
     h        = off_bh %  H # Which head are we in
 
-    # Ptr arithmetic :)
-    q_nope_ptr = Q_NOPE  + b * s_qnp_b + h * s_qnp_h + start_m * BLOCK_M * s_qnp_n
-    q_pe_ptr   = Q_PE    + b * s_qpe_b + h * s_qpe_h + start_m * BLOCK_M * s_qpe_n
+    # Calculate offsets into W_KV tensor - C1 and V dimensions interlaced in head dim
+    wkv_offset = h * (QK_NOPE_DIM_PROJ + V_HEAD_DIM)
+    wkv_ptr_nope = W_KV + wkv_offset
+    wkv_ptr_v = W_KV + wkv_offset + QK_NOPE_DIM_PROJ
+    
+    # Ptr arithmetic for other tensors
+    q_nope_ptr = Q_NOPE   + b * s_qnp_b + h * s_qnp_h + start_m * BLOCK_M * s_qnp_n
+    q_pe_ptr   = Q_PE     + b * s_qpe_b + h * s_qpe_h + start_m * BLOCK_M * s_qpe_n
     kv_ptr     = KV_CACHE + b * s_kv_b
     pe_ptr     = PE_CACHE + b * s_pe_b
-    o_ptr      = OUT      + b * s_o_b  + h * s_o_h  + start_m * BLOCK_M * s_o_n
-    wv_ptr     = W_KV      + h * s_wkv_t
+    o_ptr      = OUT      + b * s_o_b   + h * s_o_h   + start_m * BLOCK_M * s_o_n
 
     # ------------------------------------------------------------------
     # 2. Load this M‑block of Q
     # ------------------------------------------------------------------
     offs_m      = tl.arange(0, BLOCK_M)
-    offs_c1     = tl.arange(0, tl.next_power_of_2(QK_NOPE_DIM_PROJ))
-    offs_r      = tl.arange(0, tl.next_power_of_2(QK_ROPE_DIM))
+    offs_c1     = tl.arange(0, tl.minimum(QK_NOPE_DIM_PROJ, 256))
+    offs_r      = tl.arange(0, tl.minimum(QK_ROPE_DIM, 256))
 
-    qnope_msk = (offs_m[:, None] < N_CTX) & (offs_c1[None, :] < QK_NOPE_DIM_PROJ)
-    qpe_msk   = (offs_m[:, None] < N_CTX) & (offs_r [None, :] < QK_ROPE_DIM)
+    qnope_msk = (start_m * BLOCK_M + offs_m[:, None] < N_CTX_Q) & (offs_c1[None, :] < QK_NOPE_DIM_PROJ)
+    qpe_msk   = (start_m * BLOCK_M + offs_m[:, None] < N_CTX_Q) & (offs_r [None, :] < QK_ROPE_DIM)
 
     q_nope_blk = tl.load(
         q_nope_ptr + offs_m[:, None] * s_qnp_n + offs_c1[None, :] * s_qnp_nd,
@@ -181,7 +185,7 @@ def _mla_attn_core_fwd(
             kv_ptr, pe_ptr,
             s_kv_n, s_kv_r, s_pe_n, s_pe_rd,
             start_m, SM_SCALE, START_POS,
-            N_CTX, N_CTX_TOTAL,
+            N_CTX_Q, N_CTX_TOTAL,
             KV_RANK, QK_ROPE_DIM,
             BLOCK_M, BLOCK_N,
             STAGE=stage1,
@@ -194,35 +198,38 @@ def _mla_attn_core_fwd(
             kv_ptr, pe_ptr,
             s_kv_n, s_kv_r, s_pe_n, s_pe_rd,
             start_m, SM_SCALE, START_POS,
-            N_CTX, N_CTX_TOTAL,
+            N_CTX_Q, N_CTX_TOTAL,
             KV_RANK, QK_ROPE_DIM,
             BLOCK_M, BLOCK_N,
             STAGE=stage2,
         )
 
     # ------------------------------------------------------------------
-    # 5. Soft‑max normalisation and projection with W_V
+    # 5. Soft‑max normalisation and output projection
     # ------------------------------------------------------------------
-    acc = (acc / l_i[:, None]).to(tl.float32)           # (M , K)
+    acc = (acc / (l_i[:, None] + 1e-6)).to(tl.float32)   # (M, K) - normalized attention output
 
-    # ---- load W_V[h]  -----------------------------------------------
-    offs_v  = tl.arange(0, tl.next_power_of_2(V_HEAD_DIM))
-    offs_k  = tl.arange(0, tl.next_power_of_2(KV_RANK))
+    # ---- Load V projection weights for each head ---------------------
+    # For MLA, we need to project the accumulated KV vectors to the final output
+    offs_v  = tl.arange(0, tl.minimum(V_HEAD_DIM, 256))
+    offs_k  = tl.arange(0, tl.minimum(KV_RANK, 256))
+    
+    # Reshape W_KV to get the V projection part
+    # Note: W_KV contains weights for both NOPE and V projections
+    wv_ptrs = wkv_ptr_v + offs_v[:, None] * s_wkv_r + offs_k[None, :] * s_wkv_c
     wv_msk  = (offs_v[:, None] < V_HEAD_DIM) & (offs_k[None, :] < KV_RANK)
-    w_v_h   = tl.load(
-        wv_ptr + offs_v[:, None] * s_wkv_r + offs_k[None, :] * s_wv_k,
-        mask=wv_msk, other=0.0,
-    ).to(acc.dtype)                                     # (V , K)
+    w_v_h   = tl.load(wv_ptrs, mask=wv_msk, other=0.0).to(acc.dtype)  # (V, K)
 
-    out_blk = tl.dot(acc, tl.trans(w_v_h))              # (M , V)
+    # Project to output space
+    out_blk = tl.dot(acc, tl.trans(w_v_h))              # (M, V)
 
-    # ---- store -------------------------------------------------------
-    offs_v_ = tl.arange(0, tl.next_power_of_2(V_HEAD_DIM))
-    out_msk = (offs_m[:, None] < N_CTX) & (offs_v_[None, :] < V_HEAD_DIM)
+    # ---- Store output ------------------------------------------------
+    offs_v_ = tl.arange(0, tl.minimum(V_HEAD_DIM, 256))
+    out_msk = (start_m * BLOCK_M + offs_m[:, None] < N_CTX_Q) & (offs_v_[None, :] < V_HEAD_DIM)
 
     tl.store(
         o_ptr + offs_m[:, None] * s_o_n + offs_v_[None, :] * s_o_vd,
-        out_blk.to(Q_NOPE.dtype),
+        out_blk.to(OUT.dtype),
         mask=out_msk,
     )
 
@@ -235,67 +242,63 @@ class _MLAttentionCore(torch.autograd.Function):
     def forward(ctx, q_nope, q_pe, kv_cache, pe_cache, w_kv,
                 causal: bool, sm_scale: float):
 
-        # Ensure contigousy
-        q_nope   = q_nope.contiguous()   # (B , H , N_ctx , NoDim)
-        q_pe     = q_pe.contiguous()     # (B , H , N_ctx , RDim )
+        # Ensure contiguity
+        q_nope   = q_nope.contiguous()   # (B, H, N_ctx, NoDim)
+        q_pe     = q_pe.contiguous()     # (B, H, N_ctx, RDim)
+        kv_cache = kv_cache.contiguous() # (B, N_total, LRank)
+        pe_cache = pe_cache.contiguous() # (B, N_total, RDim)
+        w_kv     = w_kv.contiguous()     # (out_features, in_features)
 
-        kv_cache = kv_cache.contiguous() # (B , N_total , LRank)
-        pe_cache = pe_cache.contiguous() # (B , N_total , RDim)
-
-        w_kv      = w_kv.contiguous()      # (H*(NoDim + Vdim), LRank )
-
-        B, H, N, NoDim        = q_nope.shape
-        _, _, _, RDim         = q_pe.shape
-        _, N_tot, LRank        = kv_cache.shape
-        temp, _           = w_kv.shape
+        # Extract dimensions
+        B, H, N_ctx, NoDim = q_nope.shape
+        _, _, _, RDim     = q_pe.shape
+        _, N_tot, LRank   = kv_cache.shape
         
-        Vdim = int((temp / H) - NoDim)
+        # Parse W_KV shape: reshape to extract the V_dim portion
+        # W_KV has dimensions (H * (NoDim + V_dim), LRank)
+        H_total, LRank_check = w_kv.shape
+        assert H_total % H == 0, f"Weight shape mismatch: {H_total} must be divisible by number of heads {H}"
+        dim_per_head = H_total // H
+        assert dim_per_head > NoDim, f"Weight dims per head ({dim_per_head}) must be > NoDim ({NoDim})"
+        V_dim = dim_per_head - NoDim
 
-        print(f"[DEBUG] q_nope.shape:   {q_nope.shape}, is_contiguous: {q_nope.is_contiguous()}")
-        print(f"[DEBUG] q_pe.shape:     {q_pe.shape}, is_contiguous: {q_pe.is_contiguous()}")
-        print(f"[DEBUG] kv_cache.shape: {kv_cache.shape}, is_contiguous: {kv_cache.is_contiguous()}")
-        print(f"[DEBUG] pe_cache.shape: {pe_cache.shape}, is_contiguous: {pe_cache.is_contiguous()}")
-        print(f"[DEBUG] w_kv.shape:     {w_kv.shape}, is_contiguous: {w_kv.is_contiguous()}")
-
-        print(f"[DEBUG] Batch size (B): {B}")
-        print(f"[DEBUG] Num heads (H):  {H}")
-        print(f"[DEBUG] Context len (N): {N}")
-        print(f"[DEBUG] NoDim: {NoDim}, RDim: {RDim}")
-        print(f"[DEBUG] N_total: {N_tot}, LRank: {LRank}")
-        print(f"[DEBUG] LRank: {LRank}, temp: {temp}")
-        print(f"[DEBUG] Vdim: {Vdim}")
-
+        # Create output tensor
         out = torch.empty(
-            (B, H, N, Vdim),
+            (B, H, N_ctx, V_dim),
             dtype=q_nope.dtype,
+            device=q_nope.device
         )
-
+        
+        # Calculate grid dimensions for the kernel
         grid = lambda meta: (
-            triton.cdiv(N, meta["BLOCK_M"]),
+            triton.cdiv(N_ctx, meta["BLOCK_M"]),
             B * H,
         )
+
+        # Start position - in full implementation should come from input
+        start_pos = 0
 
         _mla_attn_core_fwd[grid](
             # ---- tensors ----
             q_nope, q_pe, kv_cache, pe_cache, w_kv, out,
 
-            # Strides
+            # ---- strides ----
             q_nope.stride(0), q_nope.stride(1), q_nope.stride(2), q_nope.stride(3),
-            q_pe.stride(0),    q_pe.stride(1),    q_pe.stride(2),   q_pe.stride(3),
+            q_pe.stride(0),   q_pe.stride(1),   q_pe.stride(2),   q_pe.stride(3),
             kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
             pe_cache.stride(0), pe_cache.stride(1), pe_cache.stride(2),
-            w_kv.stride(0),         w_kv.stride(1),
+            w_kv.stride(0),    w_kv.stride(1),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
 
-            # Sizes
-            B, H, N, N_tot,
-            sm_scale,
+            # ---- sizes ----
+            B, H, N_ctx, N_tot,
+            sm_scale, start_pos,
 
-            # Consts
+            # ---- consts ----
             KV_RANK=LRank,
             QK_NOPE_DIM_PROJ=NoDim,
             QK_ROPE_DIM=RDim,
-            V_HEAD_DIM=Vdim,
+            V_HEAD_DIM=V_dim,
             causal=causal,
         )
 
